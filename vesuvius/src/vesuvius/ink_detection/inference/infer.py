@@ -39,6 +39,7 @@ from vesuvius.ink_detection.inference.engines import (
     EngineUnavailable,
     FlatEngine,
     FlatEngineRequest,
+    WindowCache,
     add_engine_arguments,
     decline_request,
     select_engine,
@@ -106,6 +107,8 @@ class ConfiguredModel:
     # model reaches the device on first use rather than sitting beside the
     # engine's own copy in GPU memory
     prepare_model: Callable[[], nn.Module] | None = None
+    # the engine's source-layer reads, shared by the directions of an input
+    window_cache: WindowCache | None = None
 
     def pytorch_model(self) -> nn.Module:
         """The device-ready PyTorch model, prepared on first use if deferred."""
@@ -1443,6 +1446,7 @@ def infer_single_zarr(
             preprocessing=configured_model.preprocessing,
             blocks=tuple(blocks),
             occupancy=occupancy,
+            window_cache=configured_model.window_cache,
         ),
         output_tiff=output_tiff,
         tile_shape=tile_shape,
@@ -1925,7 +1929,12 @@ def run(
     if engine is None:
         configured = replace(configured, model=prepare())
     else:
-        configured = replace(configured, engine=engine, prepare_model=functools.cache(prepare))
+        configured = replace(
+            configured,
+            engine=engine,
+            prepare_model=functools.cache(prepare),
+            window_cache=WindowCache(),
+        )
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
