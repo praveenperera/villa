@@ -14,10 +14,12 @@ from vc_reader.reader import ZarrWriter, create_group
 
 from vesuvius.ink_detection.config import InkConfig
 from vesuvius.ink_detection.inference import engine_parity
+from vesuvius.ink_detection.inference import engines
 from vesuvius.ink_detection.inference.engines import (
     EngineUnavailable,
     FlatEngineResult,
     InkrsEngine,
+    WindowCache,
     select_engine,
 )
 from vesuvius.ink_detection.inference.infer import (
@@ -429,6 +431,57 @@ def test_inkrs_adapter_sends_layers_in_model_order_and_villas_occupancy(tmp_path
         # a bare array has no pyramid, so villa scans nothing and neither may inkrs
         assert occupancy is None
     assert (tifffile.imread(tmp_path / "out.tif") == 9).all()
+
+
+def test_both_directions_read_the_source_layers_once(tmp_path, monkeypatch):
+    surface, volume = _write_surface(tmp_path / "surface.zarr")
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    reads = []
+    real_read = engines._read_span
+    monkeypatch.setattr(
+        engines, "_read_span", lambda *a: reads.append(a[2:]) or real_read(*a)
+    )
+    handle = _RecordingHandle()
+    engine = InkrsEngine(_fake_inkrs(None), handle, device_index=0)
+    args = normalize_inference_paths(
+        parse_args(
+            [str(surface), str(checkpoint), str(tmp_path / "out.tif"), *COMMON,
+             "--layer-start", "1", "--layer-end", "4", "--direction", "both"]
+        )
+    )
+
+    assert run(args, engine_factory=lambda *_: engine) == 0
+
+    assert reads == [(1, 4)]
+    [forward, reverse] = [call[0] for call in handle.calls]
+    np.testing.assert_array_equal(forward, volume[[1, 2, 3]])
+    np.testing.assert_array_equal(reverse, volume[[3, 2, 1]])
+
+
+def test_window_cache_keeps_one_span_and_never_a_failed_read():
+    cache = WindowCache()
+    calls = []
+
+    def read(value):
+        def inner():
+            calls.append(value)
+            return np.full((1, 2, 2), value, np.uint8)
+        return inner
+
+    first = cache.span(("a", "0", True, 0, 1), read(1))
+    assert cache.span(("a", "0", True, 0, 1), read(2)) is first
+    # the shared span is read-only, so one engine cannot change another's input
+    assert not first.flags.writeable
+    assert (cache.span(("b", "0", True, 0, 1), read(3)) == 3).all()
+    assert (cache.span(("a", "0", True, 0, 1), read(4)) == 4).all()
+    assert calls == [1, 3, 4]
+
+    def broken():
+        raise OSError("unreadable chunk")
+
+    with pytest.raises(OSError):
+        cache.span(("c", "0", True, 0, 1), broken)
+    assert (cache.span(("c", "0", True, 0, 1), read(5)) == 5).all()
 
 
 def test_engine_shape_mismatch_is_an_error_not_a_written_map(tmp_path):

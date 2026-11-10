@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 import importlib
 import logging
+import threading
 import time
+from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Protocol
@@ -72,6 +74,9 @@ class FlatEngineRequest:
     preprocessing: str
     blocks: tuple[Any, ...]
     occupancy: np.ndarray | None = None
+    # shared by the requests of one run, so the directions of an input read
+    # their common source layers once; None reads every request afresh
+    window_cache: WindowCache | None = None
 
 
 @dataclass(frozen=True)
@@ -129,18 +134,91 @@ def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
+SpanKey = tuple[str, str, bool, int, int]
+
+
+class WindowCache:
+    """The last source-layer span read, kept for the next request that needs it.
+
+    The forward and reverse runs of one input select the same layers in
+    opposite orders, so the second takes its window from the first's read.
+    One span is kept at a time; a request for another span replaces it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._entry: tuple[SpanKey, Future] | None = None
+
+    def span(self, key: SpanKey, read: Callable[[], np.ndarray]) -> np.ndarray:
+        """Return the span for ``key``, calling ``read`` unless it is cached."""
+
+        with self._lock:
+            entry = self._entry
+            if entry is None or entry[0] != key:
+                entry = (key, Future())
+                self._entry = entry
+                owner = True
+            else:
+                owner = False
+        future = entry[1]
+        if owner:
+            try:
+                span = read()
+                # later requests share this array, so no engine may change it
+                span.flags.writeable = False
+                future.set_result(span)
+            except BaseException as exc:
+                future.set_exception(exc)
+                with self._lock:
+                    # a failed read is not kept for the next request
+                    if self._entry is entry:
+                        self._entry = None
+                raise
+        return future.result()
+
+    def clear(self) -> None:
+        """Drop the kept span."""
+
+        with self._lock:
+            self._entry = None
+
+
+def _span_key(request: FlatEngineRequest, low: int, high: int) -> SpanKey:
+    return (
+        str(request.input_zarr),
+        str(request.resolution),
+        bool(request.depth_axis_first),
+        low,
+        high,
+    )
+
+
+def _read_span(volume: Any, depth_axis_first: bool, low: int, high: int) -> np.ndarray:
+    """Read layers ``low:high`` as a C-contiguous (Z, H, W) array."""
+
+    if depth_axis_first:
+        return np.ascontiguousarray(volume[low:high])
+    return np.ascontiguousarray(np.moveaxis(np.asarray(volume[:, :, low:high]), -1, 0))
+
+
 def read_window(request: FlatEngineRequest) -> np.ndarray:
     """Read the selected source layers as a contiguous (Z, H, W) array.
 
-    Layers are in model order, so a reverse run is already reversed.
+    Layers are in model order, so a reverse run is already reversed. With a
+    ``window_cache``, a span an earlier request read is not read again.
     """
 
     indices = np.asarray(request.layer_indices, dtype=np.int64)
     low, high = int(indices.min()), int(indices.max()) + 1
-    if request.depth_axis_first:
-        span = np.asarray(request.volume[low:high])
-    else:
-        span = np.moveaxis(np.asarray(request.volume[:, :, low:high]), -1, 0)
+
+    def read() -> np.ndarray:
+        return _read_span(request.volume, request.depth_axis_first, low, high)
+
+    cache = request.window_cache
+    span = read() if cache is None else cache.span(_span_key(request, low, high), read)
+    if np.array_equal(indices, np.arange(low, high)):
+        # forward order is the span itself; the engine only reads it
+        return span
     return np.ascontiguousarray(span[indices - low])
 
 
