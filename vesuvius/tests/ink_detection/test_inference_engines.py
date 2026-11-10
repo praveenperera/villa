@@ -531,6 +531,9 @@ def test_engine_runs_leave_pytorch_off_the_device_until_an_input_falls_back(
         return real_prepare(model, **kwargs)
 
     monkeypatch.setattr(infer, "prepare_model_for_inference", counting_prepare)
+    built = []
+    real_make = infer.make_model
+    monkeypatch.setattr(infer, "make_model", lambda config: built.append(config) or real_make(config))
 
     class _Engine:
         name = "fixed"
@@ -562,12 +565,14 @@ def test_engine_runs_leave_pytorch_off_the_device_until_an_input_falls_back(
         assert released() is None
     finally:
         gc.enable()
-    assert prepared == []
+    # an engine that runs every input never needs the PyTorch model built
+    assert prepared == [] and built == []
 
     run_with(_Engine(decline=True), "fallback.tif")
-    # both directions fell back, and the model was prepared once for both
-    assert len(prepared) == 1
+    # both directions fell back, and the model was built and prepared once for both
+    assert len(prepared) == 1 and len(built) == 1
     run_with(None, "torch.tif")
+    assert len(built) == 2
     for name in ("", "_reverse"):
         np.testing.assert_array_equal(
             tifffile.imread(tmp_path / f"fallback{name}.tif"),
