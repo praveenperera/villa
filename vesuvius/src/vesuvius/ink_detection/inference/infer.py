@@ -5,6 +5,7 @@ from __future__ import annotations
 from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
+import functools
 import json
 import logging
 import math
@@ -17,7 +18,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.parse import urlparse
 
 import numpy as np
@@ -33,6 +34,15 @@ from vesuvius.ink_detection.models.checkpoint import (
     select_inference_weights,
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
+from vesuvius.ink_detection.inference.engines import (
+    EngineFactory,
+    EngineUnavailable,
+    FlatEngine,
+    FlatEngineRequest,
+    add_engine_arguments,
+    decline_request,
+    select_engine,
+)
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
@@ -40,6 +50,7 @@ from vesuvius.ink_detection.inference.inference_runtime import (
     iter_mirror_axes,
     parse_gpu_ids,
     prepare_model_for_inference,
+    resolve_inference_device,
     resolve_amp_dtype,
 )
 from vesuvius.ink_detection.models.model import make_model
@@ -84,6 +95,17 @@ class ConfiguredModel:
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
+    # an optional alternative to the PyTorch forward and blend; see engines.py
+    engine: FlatEngine | None = None
+    # with an engine, PyTorch runs only the inputs the engine declines, so the
+    # model reaches the device on first use rather than sitting beside the
+    # engine's own copy in GPU memory
+    prepare_model: Callable[[], nn.Module] | None = None
+
+    def pytorch_model(self) -> nn.Module:
+        """The device-ready PyTorch model, prepared on first use if deferred."""
+
+        return self.model if self.prepare_model is None else self.prepare_model()
 
 
 def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
@@ -1070,6 +1092,21 @@ def write_output_tiff(
     )
 
 
+def write_uint8_tiff(
+    image: np.ndarray, output_path: Path, tile_shape: tuple[int, int]
+) -> None:
+    """Write a finished uint8 map with the same layout as write_output_tiff."""
+
+    height, width = (int(value) for value in image.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    tiles = (
+        np.ascontiguousarray(image[y0 : y0 + tile_h, x0 : x0 + tile_w])
+        for y0 in range(0, height, tile_h)
+        for x0 in range(0, width, tile_w)
+    )
+    _write_tiled_tiff(output_path, (height, width), tile_shape, tiles)
+
+
 def open_temp_zarr_array(
     path: Path,
     *,
@@ -1368,6 +1405,35 @@ def infer_single_zarr(
     LOGGER.info("Selected %d patches for inference", len(blocks))
     output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
+    if configured_model.engine is not None and run_with_engine(
+        configured_model.engine,
+        FlatEngineRequest(
+            input_zarr=input_zarr,
+            resolution=resolution,
+            volume=volume,
+            depth_axis_first=depth_first,
+            height=height,
+            width=width,
+            layer_indices=layer_indices,
+            input_depth=configured_model.input_depth,
+            patch_size=patch_size,
+            stride=stride,
+            blend_mode=blend_mode,
+            preprocessing=configured_model.preprocessing,
+            blocks=tuple(blocks),
+            occupancy=occupancy,
+        ),
+        output_tiff=output_tiff,
+        tile_shape=tile_shape,
+        fallback=args.engine_fallback,
+        # the engine request carries no ROI or mask, so those runs stay on PyTorch
+        declined=(
+            "it does not crop to --roi" if roi_bounds is not None
+            else "it does not apply --mask-path" if mask is not None
+            else None
+        ),
+    ):
+        return
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1447,7 +1513,7 @@ def infer_single_zarr(
         if blocks:
             run_block_inference(
                 loader=loader,
-                model=configured_model.model,
+                model=configured_model.pytorch_model(),
                 accumulator=accumulator,
                 weight_map=weight_map,
                 mask=mask,
@@ -1483,6 +1549,38 @@ def infer_single_zarr(
             }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+
+
+def run_with_engine(
+    engine: FlatEngine,
+    request: FlatEngineRequest,
+    *,
+    output_tiff: Path,
+    tile_shape: tuple[int, int],
+    fallback: str,
+    declined: str | None = None,
+) -> bool:
+    """Write one map with an alternative engine; False leaves it to PyTorch."""
+
+    reason = declined or engine.unsupported_reason(request)
+    if reason is not None:
+        decline_request(engine, request, reason, fallback=fallback)
+        return False
+    try:
+        result = engine.predict(request)
+    except EngineUnavailable as exc:
+        decline_request(engine, request, str(exc), fallback=fallback)
+        return False
+    expected = (request.height, request.width)
+    if result.probability.shape != expected or result.coverage.shape != expected:
+        raise RuntimeError(
+            f"The {engine.name} engine returned maps of shape "
+            f"{result.probability.shape} and {result.coverage.shape}, expected {expected}"
+        )
+    # an overwritten image must not inherit an earlier ROI run's metadata
+    output_tiff.with_suffix(output_tiff.suffix + ".roi.json").unlink(missing_ok=True)
+    write_uint8_tiff(result.probability, output_tiff, tile_shape)
+    return True
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -1734,6 +1832,7 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--compile-mode", default="reduce-overhead")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false")
     parser.set_defaults(compile_model=True)
+    add_engine_arguments(parser)
     args = parser.parse_args(argv)
     if args.num_workers < 0:
         parser.error("--num-workers must be nonnegative")
@@ -1760,8 +1859,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run(normalize_inference_paths(parse_args(argv)))
 
 
-def run(args: argparse.Namespace) -> int:
-    """Run parsed flat inference arguments."""
+def run(
+    args: argparse.Namespace, *, engine_factory: EngineFactory | None = None
+) -> int:
+    """Run parsed flat inference arguments.
+
+    ``engine_factory`` replaces the engine that ``--engine`` names, for tools
+    that compare engines.
+    """
 
     logging.basicConfig(
         level=logging.INFO,
@@ -1770,14 +1875,28 @@ def run(args: argparse.Namespace) -> int:
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
     configured = configure_model(args)
-    prepared_model, device = prepare_model_for_inference(
-        configured.model,
-        gpu_ids=args.gpu_ids,
-        device_type=args.device,
-        compile_model=args.compile_model,
-        compile_mode=args.compile_mode,
-    )
-    configured = replace(configured, model=prepared_model)
+    device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
+    # the closure holds the bare model, not `configured`, which will hold the
+    # closure and the engine; that cycle would keep the engine's GPU memory
+    # alive after run() returns, until the next full garbage collection
+    source_model = configured.model
+
+    def prepare() -> nn.Module:
+        model, _ = prepare_model_for_inference(
+            source_model,
+            gpu_ids=args.gpu_ids,
+            device_type=args.device,
+            device=device,
+            compile_model=args.compile_model,
+            compile_mode=args.compile_mode,
+        )
+        return model
+
+    engine = select_engine(args, configured, device, factory=engine_factory)
+    if engine is None:
+        configured = replace(configured, model=prepare())
+    else:
+        configured = replace(configured, engine=engine, prepare_model=functools.cache(prepare))
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
