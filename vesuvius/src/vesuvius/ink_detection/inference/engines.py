@@ -1,0 +1,315 @@
+"""Optional alternative engines for flat ink inference.
+
+The default engine is the PyTorch path in ``infer.py``. An alternative engine
+receives the same per-direction request that the PyTorch path would run (the
+source layers in model order and villa's tile schedule after the low-resolution
+occupancy skip) and returns the same uint8 map and its coverage. villa keeps
+scheduling, TIFF writing and folder handling, so an engine only replaces the
+forward, normalization and blending work.
+
+Engines are opt-in with ``--engine``. When the requested engine cannot run, the
+command logs why and continues with PyTorch, unless ``--engine-fallback error``
+is given.
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Protocol
+
+import numpy as np
+import torch
+
+LOGGER = logging.getLogger(__name__)
+
+ENGINE_CHOICES = ("torch", "inkrs")
+FALLBACK_CHOICES = ("torch", "error")
+
+# inkrs judges the checkpoint, the volume and the GPU itself and raises
+# inkrs.UnsupportedError for what it does not implement; villa checks only its
+# own options, which inkrs never sees
+INKRS_BLEND_MODE = "hann"
+INKRS_MAX_STRIDE = 128
+
+
+class EngineUnavailable(RuntimeError):
+    """The requested engine cannot run this command or this input.
+
+    ``FlatEngine.predict`` raises it to decline an input before doing any
+    work; villa then runs that input with PyTorch, or stops under
+    ``--engine-fallback error``.
+    """
+
+
+@dataclass(frozen=True)
+class FlatEngineRequest:
+    """One direction of one flat input, scheduled exactly as PyTorch runs it.
+
+    ``blocks`` are villa's tiles after the low-resolution occupancy skip, in
+    villa's order, and ``occupancy`` is the 2D mask that skip used (None when
+    the input has no pyramid to scan); its scale to the volume is
+    ``round(height / mask_height)``. The engine applies the second skip
+    itself: a tile whose selected source layers are all zero contributes
+    nothing.
+    """
+
+    input_zarr: str | Path
+    resolution: str
+    volume: Any
+    depth_axis_first: bool
+    height: int
+    width: int
+    layer_indices: np.ndarray
+    input_depth: int
+    patch_size: int
+    stride: int
+    blend_mode: str
+    preprocessing: str
+    blocks: tuple[Any, ...]
+    occupancy: np.ndarray | None = None
+
+
+@dataclass(frozen=True)
+class FlatEngineResult:
+    """A finished flat map in villa's output contract.
+
+    ``probability`` is ``trunc(255 * clip(sum(p * w) / sum(w), 0, 1))`` as
+    uint8, 0 where the weight sum is at most 1e-6. ``coverage`` is true where
+    the weight sum is above 1e-6.
+    """
+
+    probability: np.ndarray
+    coverage: np.ndarray
+
+
+class FlatEngine(Protocol):
+    """An alternative to the PyTorch forward, normalization and blend."""
+
+    name: str
+
+    def unsupported_reason(self, request: FlatEngineRequest) -> str | None:
+        """Return why this request cannot run, or None when it can."""
+
+    def predict(self, request: FlatEngineRequest) -> FlatEngineResult:
+        """Run one request and return its finished map.
+
+        Raises EngineUnavailable to decline the request before any work.
+        """
+
+
+EngineFactory = Callable[[argparse.Namespace, Any, torch.device], FlatEngine]
+
+
+def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the opt-in engine selection flags to the flat inference CLI."""
+
+    parser.add_argument(
+        "--engine",
+        choices=ENGINE_CHOICES,
+        default="torch",
+        help=(
+            "Inference engine. 'torch' (default) is the PyTorch path. 'inkrs' "
+            "uses the optional inkrs package for supported models on supported "
+            "NVIDIA GPUs and writes the same maps to within 4/255."
+        ),
+    )
+    parser.add_argument(
+        "--engine-fallback",
+        choices=FALLBACK_CHOICES,
+        default="torch",
+        help=(
+            "What to do when --engine cannot run a command or an input: "
+            "continue with PyTorch and log why (default), or stop with an error."
+        ),
+    )
+
+
+def read_window(request: FlatEngineRequest) -> np.ndarray:
+    """Read the selected source layers as a contiguous (Z, H, W) array.
+
+    Layers are in model order, so a reverse run is already reversed.
+    """
+
+    indices = np.asarray(request.layer_indices, dtype=np.int64)
+    low, high = int(indices.min()), int(indices.max()) + 1
+    if request.depth_axis_first:
+        span = np.asarray(request.volume[low:high])
+    else:
+        span = np.moveaxis(np.asarray(request.volume[:, :, low:high]), -1, 0)
+    return np.ascontiguousarray(span[indices - low])
+
+
+class InkrsEngine:
+    """Run flat inference through the optional ``inkrs`` package.
+
+    ``inkrs`` is imported only when this engine is selected, so villa neither
+    depends on it nor imports it by default.
+    """
+
+    name = "inkrs"
+
+    def __init__(self, module: Any, handle: Any, *, device_index: int) -> None:
+        self._module = module
+        self._handle = handle
+        self.device_index = int(device_index)
+
+    @classmethod
+    def load(
+        cls,
+        args: argparse.Namespace,
+        configured_model: Any,
+        device: torch.device,
+    ) -> "InkrsEngine":
+        """Check the command, import inkrs and load the checkpoint into it."""
+
+        reasons = []
+        if device.type != "cuda":
+            reasons.append(f"it needs a CUDA device, got {device.type!r}")
+        if len(getattr(args, "gpu_ids", ())) > 1:
+            reasons.append("it runs on one GPU; drop --gpus or pass one id")
+        if getattr(args, "ensemble_checkpoint", None):
+            reasons.append("it does not run --ensemble-checkpoint")
+        if getattr(args, "tta_mirror", False):
+            reasons.append("it does not run --tta-mirror")
+        # --amp-dtype can override the checkpoint's dtype, which is all inkrs
+        # sees; no dtype means torch.autocast's CUDA default, fp16 unless changed
+        amp_dtype = configured_model.amp_dtype or torch.get_autocast_dtype("cuda")
+        if amp_dtype != torch.float16:
+            reasons.append(f"it reproduces fp16 autocast only, got {amp_dtype}")
+        if reasons:
+            raise EngineUnavailable("; ".join(reasons))
+
+        try:
+            module = importlib.import_module("inkrs")
+        except ImportError as exc:
+            raise EngineUnavailable(
+                f"the inkrs package is not installed ({exc}); install it with "
+                "`pip install inkrs`"
+            ) from exc
+
+        device_index = 0 if device.index is None else int(device.index)
+        handle = _inkrs_open(module, Path(args.checkpoint), device_index)
+        LOGGER.info(
+            "Using the inkrs engine %s on CUDA device %d",
+            getattr(module, "__version__", "(unknown version)"),
+            device_index,
+        )
+        return cls(module, handle, device_index=device_index)
+
+    def unsupported_reason(self, request: FlatEngineRequest) -> str | None:
+        # dtype, size and the 4 GiB window limit are inkrs's to judge, in predict
+        if request.blend_mode != INKRS_BLEND_MODE:
+            return f"it blends with Hann only, got {request.blend_mode!r}"
+        if not 1 <= request.stride <= INKRS_MAX_STRIDE:
+            return f"it needs a stride from 1 to {INKRS_MAX_STRIDE}, got {request.stride}"
+        # villa zero-pads a shallow input to the model depth; inkrs has no padding
+        if len(request.layer_indices) != request.input_depth:
+            return (
+                f"it needs exactly {request.input_depth} source layers, got "
+                f"{len(request.layer_indices)} (the input is shallower than the model)"
+            )
+        return None
+
+    def predict(self, request: FlatEngineRequest) -> FlatEngineResult:
+        started = time.perf_counter()
+        window = read_window(request)
+        read_s = time.perf_counter() - started
+        probability, coverage = _inkrs_infer(
+            self._module, self._handle, window, request.occupancy, stride=request.stride
+        )
+        LOGGER.info(
+            "inkrs ran %d scheduled tiles in %.2f s (window read %.2f s)",
+            len(request.blocks),
+            time.perf_counter() - started,
+            read_s,
+        )
+        return FlatEngineResult(
+            probability=np.asarray(probability, dtype=np.uint8),
+            coverage=np.asarray(coverage, dtype=bool),
+        )
+
+
+def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:
+    """Load a checkpoint into inkrs, mapping its refusals to EngineUnavailable.
+
+    inkrs raises ``inkrs.UnsupportedError`` for a model or GPU it does not
+    implement, or a ``.pth`` it cannot export; for a ``.pth`` it finds or
+    makes its safetensors export itself. Any other ``inkrs.InkrsError``, such
+    as missing CUDA libraries, is a real failure and is raised.
+    """
+
+    try:
+        return module.Engine(checkpoint, device=device_index)
+    except module.UnsupportedError as exc:
+        raise EngineUnavailable(
+            f"inkrs cannot load {checkpoint.name} on CUDA device {device_index}: {exc}"
+        ) from exc
+
+
+def _inkrs_infer(
+    module: Any,
+    handle: Any,
+    window: np.ndarray,
+    occupancy: np.ndarray | None,
+    *,
+    stride: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    # the window is already in model order, so it runs forward from layer 0;
+    # villa's own occupancy mask keeps its tile schedule
+    try:
+        [(probability, coverage)] = handle.run(
+            window, [(0, 1)], stride=stride, occupancy=occupancy, coverage=True
+        )
+    except module.UnsupportedError as exc:
+        # inkrs checks the volume before any GPU work, so nothing ran
+        raise EngineUnavailable(f"inkrs does not support this input: {exc}") from exc
+    return probability, coverage
+
+
+ENGINE_FACTORIES: dict[str, EngineFactory] = {"inkrs": InkrsEngine.load}
+
+
+def select_engine(
+    args: argparse.Namespace,
+    configured_model: Any,
+    device: torch.device,
+    *,
+    factory: EngineFactory | None = None,
+) -> FlatEngine | None:
+    """Return the requested engine, or None for the PyTorch path.
+
+    ``factory`` replaces the factory that ``--engine`` names, for tools that
+    compare engines.
+    """
+
+    name = str(getattr(args, "engine", "torch"))
+    if factory is None and name == "torch":
+        return None
+    factory = factory or ENGINE_FACTORIES[name]
+    try:
+        return factory(args, configured_model, device)
+    except EngineUnavailable as exc:
+        if getattr(args, "engine_fallback", "torch") == "error":
+            raise
+        LOGGER.warning(
+            "The %s engine cannot run this command: %s. Continuing with PyTorch.",
+            name,
+            exc,
+        )
+        return None
+
+
+def decline_request(
+    engine: FlatEngine, request: FlatEngineRequest, reason: str, *, fallback: str
+) -> None:
+    """Log that PyTorch runs this request instead, or raise under fallback=error."""
+
+    message = f"The {engine.name} engine cannot run {request.input_zarr}: {reason}"
+    if fallback == "error":
+        raise EngineUnavailable(message)
+    LOGGER.warning("%s. Running this input with PyTorch.", message)
