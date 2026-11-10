@@ -88,9 +88,14 @@ class ChunkKey:
 
 @dataclass(frozen=True)
 class ConfiguredModel:
-    """The checkpoint-derived flat model and preprocessing contract."""
+    """The checkpoint-derived flat model and preprocessing contract.
 
-    model: nn.Module
+    ``model`` is None when the contract was read without building the model
+    (``configure_model(..., build_model=False)``); ``prepare_model`` then
+    builds it on first use.
+    """
+
+    model: nn.Module | None
     patch_size: int
     input_depth: int
     preprocessing: str
@@ -1194,12 +1199,20 @@ def resolve_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
     return [Path(args.checkpoint), *(Path(path) for path in extra)]
 
 
-def configure_model(args: argparse.Namespace) -> ConfiguredModel:
-    """Rebuild flat model(s) and one shared preprocessing contract."""
+def configure_model(
+    args: argparse.Namespace, *, build_model: bool = True
+) -> ConfiguredModel:
+    """Rebuild flat model(s) and one shared preprocessing contract.
+
+    With ``build_model=False`` only the checkpoints' contracts are read and
+    checked, and the result's ``model`` is None.
+    """
 
     checkpoints = resolve_checkpoint_paths(args)
     members = [
-        configure_single_model(checkpoint, amp_dtype=args.amp_dtype)
+        configure_single_model(
+            checkpoint, amp_dtype=args.amp_dtype, build_model=build_model
+        )
         for checkpoint in checkpoints
     ]
     if len(members) == 1:
@@ -1218,6 +1231,8 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
                 f"Ensemble checkpoint {str(checkpoint)!r} is incompatible with "
                 f"{str(checkpoints[0])!r}: " + ", ".join(mismatched)
             )
+    if not build_model:
+        return reference
     LOGGER.info(
         "Averaging probabilities of %d checkpoints: %s",
         len(members),
@@ -1230,9 +1245,13 @@ def configure_model(args: argparse.Namespace) -> ConfiguredModel:
 
 
 def configure_single_model(
-    checkpoint: Path, *, amp_dtype: str
+    checkpoint: Path, *, amp_dtype: str, build_model: bool = True
 ) -> ConfiguredModel:
-    """Rebuild one strict flat model and preprocessing contract from checkpoint."""
+    """Rebuild one strict flat model and preprocessing contract from checkpoint.
+
+    With ``build_model=False`` the checkpoint is checked as for a build but
+    no model is made, and the result's ``model`` is None.
+    """
 
     payload = load_checkpoint(checkpoint)
     if not isinstance(payload, Mapping) or not isinstance(
@@ -1249,25 +1268,27 @@ def configure_single_model(
     selected_state, state = select_inference_weights(
         payload, source=checkpoint
     )
-    base_model = make_model(config)
-    incompatibility = load_flat_inference_state(base_model, state)
-    LOGGER.info(
-        "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
-        selected_state,
-        checkpoint,
-        len(incompatibility.missing_keys),
-        len(incompatibility.unexpected_keys),
-    )
-    base_model.eval()
     crop_z, crop_y, crop_x = config.model.crop_size
     if crop_y != crop_x:
         raise ValueError(
             f"Flat inference requires square Y/X patches, got {config.model.crop_size!r}"
         )
-    model = TargetModel(
-        base_model,
-        input_pad_depth_to=config.model.input_pad_depth_to,
-    ).eval()
+    model = None
+    if build_model:
+        base_model = make_model(config)
+        incompatibility = load_flat_inference_state(base_model, state)
+        LOGGER.info(
+            "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
+            selected_state,
+            checkpoint,
+            len(incompatibility.missing_keys),
+            len(incompatibility.unexpected_keys),
+        )
+        base_model.eval()
+        model = TargetModel(
+            base_model,
+            input_pad_depth_to=config.model.input_pad_depth_to,
+        ).eval()
     return ConfiguredModel(
         model=model,
         patch_size=crop_y,
@@ -1874,7 +1895,12 @@ def run(
     )
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
-    configured = configure_model(args)
+    # an engine runs without the PyTorch model, so with one requested the
+    # model is built only for the first input PyTorch runs, if any
+    engine_requested = (
+        engine_factory is not None or str(getattr(args, "engine", "torch")) != "torch"
+    )
+    configured = configure_model(args, build_model=not engine_requested)
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
     # the closure holds the bare model, not `configured`, which will hold the
     # closure and the engine; that cycle would keep the engine's GPU memory
@@ -1882,8 +1908,11 @@ def run(
     source_model = configured.model
 
     def prepare() -> nn.Module:
+        model = source_model
+        if model is None:
+            model = configure_model(args).model
         model, _ = prepare_model_for_inference(
-            source_model,
+            model,
             gpu_ids=args.gpu_ids,
             device_type=args.device,
             device=device,
