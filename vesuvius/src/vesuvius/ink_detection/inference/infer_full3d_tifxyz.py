@@ -29,7 +29,13 @@ from vesuvius.ink_detection.data.geometry import (
     project_surface_distance,
     select_flat_pixels_via_stored_resolution,
 )
-from vesuvius.ink_detection.data.normalization import normalize_image
+from vesuvius.ink_detection.data.normalization import (
+    HISTOGRAM_TABLE_MODES,
+    UINT8_TABLE_MODES,
+    normalize_image,
+    uint8_normalization_table,
+    uint8_table_matches_normalizer,
+)
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
     TargetModel,
@@ -153,6 +159,20 @@ def parse_args(argv: Sequence[str] | None = None):
             "GPU memory cap for --blend-device cuda accumulators. Chunks past "
             "it blend on the host. Default: half the free GPU memory after "
             "the first batch."
+        ),
+    )
+    parser.add_argument(
+        "--normalize-device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help=(
+            "Where input patches are normalized. cuda sends each raw uint8 "
+            "patch and a 256-entry table built from its histogram to the "
+            "model's GPU, which gives the same float32 inputs as cpu with a "
+            "quarter of the host traffic. It needs a CUDA model device, a "
+            "uint8 volume, data mode full_3d and normalization "
+            + ", ".join(sorted(UINT8_TABLE_MODES))
+            + "."
         ),
     )
     parser.add_argument("--tta", action="store_true")
@@ -962,6 +982,7 @@ class NativePatchDataset(Dataset):
         config,
         cache_dir=None,
         cache_max_gb=None,
+        device_normalize: bool = False,
     ) -> None:
         self.tifxyz_dir = Path(tifxyz_dir)
         self.volume_path = str(volume_path)
@@ -972,6 +993,24 @@ class NativePatchDataset(Dataset):
         self.normalization = config.data.normalization
         self.cache_dir = cache_dir
         self.cache_max_gb = cache_max_gb
+        # device_normalize yields raw uint8 samples for normalize_on_device
+        self.device_normalize = bool(device_normalize)
+        if self.device_normalize and (
+            self.mode != "full_3d" or self.normalization.mode not in UINT8_TABLE_MODES
+        ):
+            raise ValueError(
+                "--normalize-device cuda needs data mode full_3d and normalization "
+                f"{', '.join(sorted(UINT8_TABLE_MODES))}; got mode {self.mode!r} "
+                f"and normalization {self.normalization.mode!r}"
+            )
+        if self.device_normalize and not uint8_table_matches_normalizer(
+            self.normalization
+        ):
+            raise RuntimeError(
+                "--normalize-device cuda: this vc_reader build normalizes "
+                "differently from the uint8 table (probably fused multiply-adds), "
+                "so device inputs would not match; use --normalize-device cpu"
+            )
         (
             self.flat_grid_stride,
             self.native_coordinate_scale,
@@ -1080,6 +1119,10 @@ class NativePatchDataset(Dataset):
 
     def _sample(self, bbox, crop: np.ndarray, valid_slices):
         starts = bbox[:3]
+        if self.device_normalize:
+            return self._raw_sample(crop, valid_slices), torch.tensor(
+                starts, dtype=torch.int64
+            )
         crop = crop.astype(np.float32, copy=False)
         if valid_slices is not None:
             crop[valid_slices] = normalize_image(
@@ -1093,6 +1136,35 @@ class NativePatchDataset(Dataset):
             image = crop[None]
         image = torch.from_numpy(np.ascontiguousarray(image)).float()
         return image, torch.tensor(starts, dtype=torch.int64)
+
+    def _raw_sample(self, crop: np.ndarray, valid_slices) -> dict[str, torch.Tensor]:
+        """Raw uint8 patch, its normalization table and its in-volume box."""
+
+        if crop.dtype != np.uint8:
+            raise TypeError(
+                f"--normalize-device cuda needs a uint8 volume, got {crop.dtype}"
+            )
+        if valid_slices is None:
+            # wholly outside the volume: every voxel stays the fill value 0
+            table = np.zeros(256, dtype=np.float32)
+            box = (0, 0, 0, 0, 0, 0)
+        else:
+            histogram = None
+            if self.normalization.mode in HISTOGRAM_TABLE_MODES:
+                # torch counts uint8 directly; np.bincount first widens the
+                # crop to int64, about 8x the memory traffic
+                region = torch.from_numpy(np.ascontiguousarray(crop[valid_slices]))
+                histogram = torch.bincount(region.reshape(-1), minlength=256).numpy()
+            table = uint8_normalization_table(histogram, self.normalization)
+            box = (
+                *(int(axis.start) for axis in valid_slices),
+                *(int(axis.stop) for axis in valid_slices),
+            )
+        return {
+            "raw": torch.from_numpy(crop),
+            "table": torch.from_numpy(table),
+            "valid_box": torch.tensor(box, dtype=torch.int64),
+        }
 
 
 def select_native_inference_weights(
@@ -1133,6 +1205,35 @@ def _load_native_model(payload, config, args) -> NativeModelBundle:
     )
 
 
+def normalize_on_device(batch: Mapping[str, torch.Tensor], device) -> torch.Tensor:
+    """Normalize a collated raw batch from NativePatchDataset on ``device``.
+
+    Each voxel becomes its patch's table entry for its uint8 code, and voxels
+    outside the patch's in-volume box become 0, as NativePatchDataset's host
+    path leaves padding. The result equals the host path's float32 batch.
+    """
+
+    # non_blocking only on CUDA, as for the host path's batch copy
+    # (pytorch/pytorch#189690 on MPS)
+    non_blocking = torch.device(device).type == "cuda"
+    raw = batch["raw"].to(device, non_blocking=non_blocking)
+    tables = batch["table"].to(device, non_blocking=non_blocking)
+    count = raw.shape[0]
+    images = torch.gather(tables, 1, raw.reshape(count, -1).long()).reshape(raw.shape)
+    spatial = tuple(raw.shape[1:])
+    for index, box in enumerate(batch["valid_box"].tolist()):
+        starts, stops = box[:3], box[3:]
+        if list(starts) == [0, 0, 0] and list(stops) == list(spatial):
+            continue
+        # a padded patch: table[0] can differ from the fill value 0 (a zero
+        # voxel inside the volume clamps to the lower percentile)
+        inside = tuple(slice(start, stop) for start, stop in zip(starts, stops))
+        kept = images[index][inside].clone()
+        images[index].zero_()
+        images[index][inside] = kept
+    return images[:, None]
+
+
 def run_native_inference(
     *,
     args,
@@ -1165,6 +1266,12 @@ def run_native_inference(
         raise ValueError(
             f"--blend-device cuda needs a CUDA model device, got {bundle.device}"
         )
+    device_normalize = bool(getattr(dataset, "device_normalize", False))
+    # the input path follows the dataset; only the CLI flag requires CUDA
+    if getattr(args, "normalize_device", "cpu") == "cuda" and bundle.device.type != "cuda":
+        raise ValueError(
+            f"--normalize-device cuda needs a CUDA model device, got {bundle.device}"
+        )
     loader = DataLoader(**loader_kwargs)
     if device_blend:
         max_gb = getattr(args, "blend_max_gb", None)
@@ -1194,11 +1301,15 @@ def run_native_inference(
     variants = tta_variants(bool(args.tta))
     with torch.inference_mode(), autocast:
         for images, metadata in loader:
-            # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
-            # read this host batch after it is freed (pytorch/pytorch#189690).
-            images = images.to(
-                bundle.device, non_blocking=bundle.device.type == "cuda"
-            )
+            if device_normalize:
+                images = normalize_on_device(images, bundle.device)
+            else:
+                # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy
+                # can read this host batch after it is freed
+                # (pytorch/pytorch#189690).
+                images = images.to(
+                    bundle.device, non_blocking=bundle.device.type == "cuda"
+                )
             probabilities = predict_batch(
                 bundle.model,
                 images,
@@ -1337,6 +1448,8 @@ def run_command(args) -> int:
         config=config,
         cache_dir=args.cache_dir,
         cache_max_gb=args.cache_max_gb,
+        # callers that build args by hand predate --normalize-device
+        device_normalize=getattr(args, "normalize_device", "cpu") == "cuda",
     )
     run_native_inference(
         args=args,

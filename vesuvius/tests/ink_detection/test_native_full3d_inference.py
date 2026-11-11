@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import math
 from pathlib import Path
 import pickle
 from types import SimpleNamespace
@@ -919,3 +921,404 @@ def test_cli_blend_device_flags():
     assert (args.blend_device, args.blend_max_gb) == ("cuda", 2.5)
     with pytest.raises(SystemExit):
         native.parse_args(["t", "c.pth", "o.zarr", "--blend-max-gb", "0"])
+
+
+_TABLE_NORMALIZATIONS = [
+    "percentile_minmax",
+    {"mode": "percentile_minmax", "percentile_lower": 6.37, "percentile_upper": 94.77},
+    {"mode": "percentile_minmax", "percentile_lower": 0.0, "percentile_upper": 100.0},
+    "minmax",
+    "none",
+    {"mode": "divide", "divisor": 7},
+    {"mode": "clip_zscore", "mean": 90.5, "std": 31.0, "clip_min": 20, "clip_max": 230},
+    {"mode": "percentile_minmax", "percentile_lower": 35.01, "percentile_upper": 59.01},
+]
+
+
+def _uint8_cases(rng):
+    """Small uint8 crops whose percentiles fall between unequal neighbours."""
+
+    for size in (1, 2, 3, 77, 101, 705, 1420, 2762):
+        yield rng.integers(0, 256, size)
+        yield rng.integers(int(rng.integers(0, 250)), 256, size)
+        yield np.clip(rng.normal(100, 30, size), 0, 255)
+        yield rng.choice([0, 7, 200, 255], size)
+        yield np.full(size, int(rng.integers(0, 256)))
+    yield np.r_[np.zeros(999), 9]
+    yield np.array([0, 7, 200, 255, 0, 7])  # fused C++ arithmetic would round this one differently
+    yield np.r_[np.zeros(4000), rng.integers(1, 256, 1000)]
+
+
+# The table must equal vc_reader's normalizer exactly (float64 percentile
+# lerp and division, float32 rounding), including fractional ranks, constant
+# crops and many zeros: inference inputs may not change by a single ulp.
+@pytest.mark.parametrize("normalization", _TABLE_NORMALIZATIONS)
+def test_uint8_normalization_table_matches_normalize_image(normalization):
+    from vesuvius.ink_detection.config import NormalizationConfig
+    from vesuvius.ink_detection.data.normalization import (
+        HISTOGRAM_TABLE_MODES,
+        normalize_image,
+        uint8_normalization_table,
+    )
+
+    config = NormalizationConfig.from_value(normalization)
+    rng = np.random.default_rng(3)
+    checked = 0
+    for values in _uint8_cases(rng):
+        crop = values.astype(np.uint8)
+        expected = normalize_image(crop.astype(np.float32), config)
+        histogram = (
+            np.bincount(crop, minlength=256)
+            if config.mode in HISTOGRAM_TABLE_MODES
+            else None
+        )
+        table = uint8_normalization_table(histogram, config)
+        assert table.dtype == np.float32 and table.shape == (256,)
+        assert np.array_equal(table[crop], expected), (crop.size, config.mode)
+        checked += 1
+    assert checked > 40
+
+
+def test_uint8_normalization_table_rejects_order_modes_and_bad_histograms():
+    from vesuvius.ink_detection.config import NormalizationConfig
+    from vesuvius.ink_detection.data.normalization import uint8_normalization_table
+
+    for mode in ("robust_mad", "robust_percentile_span"):
+        with pytest.raises(ValueError, match="no uint8 normalization table"):
+            uint8_normalization_table(
+                np.ones(256, dtype=np.int64), NormalizationConfig.from_value(mode)
+            )
+    with pytest.raises(ValueError, match="256-bin"):
+        uint8_normalization_table(
+            np.ones(255, dtype=np.int64),
+            NormalizationConfig.from_value("percentile_minmax"),
+        )
+
+
+class _ArrayVolume:
+    """In-memory volume with vc_reader's single and batched read calls."""
+
+    def __init__(self, values):
+        self.values = values
+        self.shape = values.shape
+        self.dtype = values.dtype
+
+    def __getitem__(self, key):
+        return self.values[key]
+
+    def read_regions(self, regions, out):
+        for (start, size), destination in zip(regions, out):
+            destination[...] = self.values[
+                tuple(slice(a, a + n) for a, n in zip(start, size))
+            ]
+        return out
+
+
+def _paired_datasets(monkeypatch, normalization, values, volume_path="local.zarr"):
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    volume = _ArrayVolume(values)
+    monkeypatch.setattr(native, "_open_shared_volume", lambda *args, **kwargs: volume)
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            mode="full_3d",
+            normalization=(
+                normalization
+                if isinstance(normalization, NormalizationConfig)
+                else NormalizationConfig.from_value(normalization)
+            ),
+        )
+    )
+    patches = native.build_patch_plan_for_chunks(
+        target_chunks=[native.ChunkId(0, 0, 0), native.ChunkId(1, 1, 1)],
+        array_shape_zyx=values.shape,
+        chunk_shape_zyx=(10, 12, 14),
+        patch_size_zyx=(8, 8, 8),
+        stride_zyx=(4, 4, 4),
+    )
+    # padded at both ends, then wholly outside the volume
+    patches = [
+        *patches,
+        native.PatchSpec(-3, 20, 25),
+        native.PatchSpec(-2, -5, -7),
+        native.PatchSpec(30, 0, 0),
+    ]
+    common = dict(
+        tifxyz_dir=Path("unused"),
+        volume_path=volume_path,
+        resolution="0",
+        patches=patches,
+        patch_size_zyx=(8, 8, 8),
+        config=config,
+    )
+    host = native.NativePatchDataset(**common)
+    device = native.NativePatchDataset(**common, device_normalize=True)
+    return host, device, patches
+
+
+# normalize_on_device must hand the model the very float32 batch the host
+# path builds, including padded and wholly outside patches, so the model
+# output and every written code stay the same
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
+        ),
+    ],
+)
+@pytest.mark.parametrize("normalization", _TABLE_NORMALIZATIONS)
+@pytest.mark.parametrize("volume_path", ["local.zarr", "s3://bucket/remote.zarr"])
+def test_device_normalize_matches_host_normalize(
+    monkeypatch, normalization, device, volume_path
+):
+    rng = np.random.default_rng(0)
+    values = np.clip(rng.normal(90, 40, (20, 24, 28)), 0, 255).astype(np.uint8)
+    values[:4] = 0  # a zero slab: in-volume zeros differ from padding
+    host, raw, patches = _paired_datasets(monkeypatch, normalization, values, volume_path)
+    expected = torch.stack([host[index][0] for index in range(len(patches))])
+    assert expected.abs().sum() > 0
+
+    sample, metadata = raw[len(patches) - 2]
+    assert sample["raw"].dtype == torch.uint8 and sample["raw"].shape == (8, 8, 8)
+    assert sample["valid_box"].tolist() == [2, 5, 7, 8, 8, 8]
+    assert metadata.tolist() == [-2, -5, -7]
+    assert raw[len(patches) - 1][0]["valid_box"].tolist() == [0] * 6
+
+    loader = torch.utils.data.DataLoader(raw, batch_size=3)
+    batches = [native.normalize_on_device(batch, torch.device(device)) for batch, _ in loader]
+    assert all(batch.device.type == device for batch in batches)
+    actual = torch.cat([batch.cpu() for batch in batches])
+    assert actual.dtype == expected.dtype == torch.float32
+    assert actual.shape == expected.shape
+    assert torch.equal(actual, expected)
+
+
+def test_device_normalize_rejects_unsupported_inputs(monkeypatch):
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    values = np.zeros((20, 24, 28), dtype=np.uint8)
+    _, raw, _ = _paired_datasets(monkeypatch, "percentile_minmax", values)
+    raw._volume = _ArrayVolume(values.astype(np.uint16))
+    with pytest.raises(TypeError, match="uint8 volume"):
+        raw[0]
+
+    for mode, normalization in (
+        ("full_3d", "robust_mad"),
+        ("full_3d_single_wrap", "percentile_minmax"),
+    ):
+        config = SimpleNamespace(
+            data=SimpleNamespace(
+                mode=mode, normalization=NormalizationConfig.from_value(normalization)
+            )
+        )
+        with pytest.raises(ValueError, match="--normalize-device cuda needs"):
+            native.NativePatchDataset(
+                tifxyz_dir=Path("unused"),
+                volume_path="local.zarr",
+                resolution="0",
+                patches=(native.PatchSpec(0, 0, 0),),
+                patch_size_zyx=(8, 8, 8),
+                config=config,
+                device_normalize=True,
+            )
+
+    bundle = native.NativeModelBundle(
+        model=torch.nn.Identity(), device=torch.device("cpu"), amp_dtype=None
+    )
+    with pytest.raises(ValueError, match="needs a CUDA model device"):
+        native.run_native_inference(
+            args=SimpleNamespace(
+                batch_size=1, gpu_ids=[], num_workers=0, tta=False, normalize_device="cuda"
+            ),
+            bundle=bundle,
+            dataset=raw,
+            plan=SimpleNamespace(),
+            output=np.zeros((2, 2, 2), dtype=np.uint8),
+            importance_map=np.ones((2, 2, 2), dtype=np.float32),
+        )
+
+
+def test_cli_normalize_device_flag():
+    assert native.parse_args(["t", "c.pth", "o.zarr"]).normalize_device == "cpu"
+    args = native.parse_args(["t", "c.pth", "o.zarr", "--normalize_device", "cuda"])
+    assert args.normalize_device == "cuda"
+    with pytest.raises(SystemExit):
+        native.parse_args(["t", "c.pth", "o.zarr", "--normalize-device", "mps"])
+
+
+def _fused_reference_normalize(crop, config):
+    """vc_reader's percentile normalizer as a build with fused multiply-adds computes it."""
+
+    values = np.sort(crop.astype(np.float64).reshape(-1))
+    count = values.size
+
+    def percentile(percent):
+        q = percent / 100
+        position = math.fma(float(count), q, 1 + q * -1.0) - 1
+        if position >= count - 1:
+            return values[-1]
+        below = math.floor(position)
+        fraction = position - below
+        low, high = values[below], values[below + 1]
+        span = high - low
+        if fraction >= 0.5:
+            return math.fma(-span, 1 - fraction, high)
+        return math.fma(span, fraction, low)
+
+    low = percentile(config.percentile_lower)
+    high = percentile(config.percentile_upper)
+    clamped = np.clip(crop.astype(np.float32), np.float32(low), np.float32(high))
+    return ((clamped.astype(np.float64) - low) / (high - low)).astype(np.float32)
+
+
+# A vc_reader build whose percentile arithmetic is fused must be refused, or
+# device inputs would drift by an ulp from the host path's
+@pytest.mark.skipif(not hasattr(math, "fma"), reason="needs math.fma")
+@pytest.mark.parametrize("bounds", [(1.0, 99.0), (35.01, 59.01), (0.5, 99.5)])
+def test_device_normalize_refuses_a_fused_normalizer(monkeypatch, bounds):
+    from vesuvius.ink_detection.config import NormalizationConfig
+    from vesuvius.ink_detection.data import normalization
+
+    config = NormalizationConfig.from_value(
+        {"mode": "percentile_minmax", "percentile_lower": bounds[0], "percentile_upper": bounds[1]}
+    )
+    normalization.uint8_table_matches_normalizer.cache_clear()
+    assert normalization.uint8_table_matches_normalizer(config)
+    crops = normalization._fma_sensitive_crops((35.01, 59.01)) + normalization._fma_sensitive_crops(bounds)
+    assert crops
+    assert any(
+        not np.array_equal(
+            _fused_reference_normalize(crop, config),
+            normalization.normalize_image(crop.astype(np.float32), config),
+        )
+        for crop in crops
+    )
+
+    monkeypatch.setattr(normalization, "normalize_image", _fused_reference_normalize)
+    normalization.uint8_table_matches_normalizer.cache_clear()
+    try:
+        assert not normalization.uint8_table_matches_normalizer(config)
+        values = np.zeros((20, 24, 28), dtype=np.uint8)
+        with pytest.raises(RuntimeError, match="fused multiply-adds"):
+            _paired_datasets(monkeypatch, config, values)
+    finally:
+        normalization.uint8_table_matches_normalizer.cache_clear()
+
+
+def _write_volume(path, values, chunks):
+    from vc_reader.reader import ZarrWriter
+
+    array = ZarrWriter.create(path, shape=values.shape, chunks=chunks, dtype="u1")
+    array[:] = values
+    return path
+
+
+def _plan_for_patches(patches, shape, chunks, patch):
+    """A NativePlan-like view: every chunk a patch touches is a target."""
+
+    counts = {}
+    for spec in patches:
+        starts = (spec.z0, spec.y0, spec.x0)
+        lows = [max(0, start) // size for start, size in zip(starts, chunks)]
+        highs = [
+            (min(extent, start + size_patch) - 1) // size
+            for start, size_patch, extent, size in zip(starts, patch, shape, chunks)
+        ]
+        if any(
+            start + size_patch <= 0 or start >= extent
+            for start, size_patch, extent in zip(starts, patch, shape)
+        ):
+            continue
+        for chunk in itertools.product(*(range(a, b + 1) for a, b in zip(lows, highs))):
+            counts[native.ChunkId(*chunk)] = counts.get(native.ChunkId(*chunk), 0) + 1
+    return SimpleNamespace(
+        target_chunks=frozenset(counts),
+        contribution_counts=counts,
+        chunk_shape_zyx=chunks,
+        patch_size_zyx=patch,
+    )
+
+
+def _settings():
+    cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+    return [
+        pytest.param("cpu", None, False, True, "cpu", id="cpu-tta"),
+        pytest.param("cuda", torch.bfloat16, False, True, "cuda", id="cuda-amp-tta", marks=cuda),
+        pytest.param("cuda", torch.bfloat16, True, False, "cuda", id="cuda-amp-compiled", marks=cuda),
+        pytest.param("cuda", torch.bfloat16, True, False, "cpu", id="cuda-compiled-host-blend", marks=cuda),
+    ]
+
+
+# Through prediction and accumulation, with spawned workers reading a real
+# zarr, a partial final batch, TTA or reduce-overhead compilation and AMP:
+# the device input path must write the host path's uint8 codes exactly
+@pytest.mark.parametrize("device, amp_dtype, compiled, tta, blend_device", _settings())
+def test_device_normalize_inference_writes_host_output(
+    tmp_path, device, amp_dtype, compiled, tta, blend_device
+):
+    from vesuvius.ink_detection.config import NormalizationConfig
+
+    rng = np.random.default_rng(1)
+    shape, chunks, patch = (20, 24, 28), (10, 12, 14), (8, 8, 8)
+    values = np.clip(rng.normal(90, 40, shape), 0, 255).astype(np.uint8)
+    values[:4] = 0
+    volume = _write_volume(tmp_path / "input.zarr", values, chunks)
+    patches = [
+        *native.build_patch_plan_for_chunks(
+            target_chunks=[native.ChunkId(0, 0, 0), native.ChunkId(1, 1, 1)],
+            array_shape_zyx=shape,
+            chunk_shape_zyx=chunks,
+            patch_size_zyx=patch,
+            stride_zyx=(4, 4, 4),
+        ),
+        native.PatchSpec(-3, 20, 25),
+        native.PatchSpec(-2, -5, -7),
+    ]
+    batch_size = 3 if len(patches) % 3 else 4
+    assert len(patches) % batch_size  # a partial final batch
+    plan = _plan_for_patches(patches, shape, chunks, patch)
+    config = SimpleNamespace(
+        data=SimpleNamespace(
+            mode="full_3d", normalization=NormalizationConfig.from_value("percentile_minmax")
+        )
+    )
+    torch.manual_seed(0)
+    model = torch.nn.Conv3d(1, 1, 3, padding=1).to(device).eval()
+    if compiled:
+        model = torch.compile(model, mode="reduce-overhead")
+    bundle = native.NativeModelBundle(model=model, device=torch.device(device), amp_dtype=amp_dtype)
+    outputs = []
+    for device_normalize in (False, True):
+        dataset = native.NativePatchDataset(
+            tifxyz_dir=Path("unused"),
+            volume_path=str(volume),
+            resolution="0",
+            patches=patches,
+            patch_size_zyx=patch,
+            config=config,
+            device_normalize=device_normalize,
+        )
+        output = np.zeros(shape, dtype=np.uint8)
+        native.run_native_inference(
+            args=SimpleNamespace(
+                batch_size=batch_size,
+                gpu_ids=[],
+                num_workers=2,
+                prefetch_factor=2,
+                tta=tta,
+                tta_batch_size=None,
+                blend_device=blend_device,
+                normalize_device="cuda" if device_normalize and device == "cuda" else "cpu",
+            ),
+            bundle=bundle,
+            dataset=dataset,
+            plan=plan,
+            output=output,
+            importance_map=native.create_importance_map(patch, mode="gaussian"),
+        )
+        outputs.append(output)
+    assert len(np.unique(outputs[0])) > 10
+    assert np.array_equal(outputs[0], outputs[1])
