@@ -142,58 +142,83 @@ class WindowCache:
 
     The forward and reverse runs of one input select the same layers in
     opposite orders, so the second takes its window from the first's read.
-    One span is kept at a time; a request for another span replaces it.
+    A span can also be read ahead on a thread (``prefetch``), so the read
+    overlaps the engine's load. One span is kept at a time; a request for
+    another span replaces it.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._entry: tuple[SpanKey, Future] | None = None
+        self._threads: list[threading.Thread] = []
+
+    def prefetch(self, key: SpanKey, read: Callable[[], np.ndarray]) -> None:
+        """Start ``read`` on a thread; a later ``span(key, ...)`` waits for it."""
+
+        future: Future = Future()
+        with self._lock:
+            self._entry = (key, future)
+
+        def work() -> None:
+            try:
+                future.set_result(_shared(read()))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        thread = threading.Thread(target=work, name="engine-window-prefetch", daemon=True)
+        with self._lock:
+            self._threads.append(thread)
+        thread.start()
+
+    def close(self) -> None:
+        """Wait for any read ahead to finish, then drop the kept span.
+
+        A zarr read can't be interrupted, so this bounds its life to the run
+        that started it rather than leaving it to hold memory afterwards.
+        """
+
+        with self._lock:
+            threads, self._threads = self._threads, []
+            self._entry = None
+        for thread in threads:
+            thread.join()
 
     def span(self, key: SpanKey, read: Callable[[], np.ndarray]) -> np.ndarray:
         """Return the span for ``key``, calling ``read`` unless it is cached."""
 
         with self._lock:
             entry = self._entry
-            if entry is None or entry[0] != key:
-                entry = (key, Future())
-                self._entry = entry
-                owner = True
-            else:
-                owner = False
-        future = entry[1]
-        if owner:
+        if entry is not None and entry[0] == key:
             try:
-                span = read()
-                # later requests share this array, so no engine may change it
-                span.flags.writeable = False
-                future.set_result(span)
-            except BaseException as exc:
-                future.set_exception(exc)
-                with self._lock:
-                    # a failed read is not kept for the next request
-                    if self._entry is entry:
-                        self._entry = None
-                raise
-        return future.result()
-
-    def clear(self) -> None:
-        """Drop the kept span."""
-
+                return entry[1].result()
+            except Exception:
+                # a failed read ahead is read again here, so any error is this call's own
+                pass
+        span = _shared(read())
+        future: Future = Future()
+        future.set_result(span)
         with self._lock:
-            self._entry = None
+            self._entry = (key, future)
+        return span
 
 
-def _span_key(request: FlatEngineRequest, low: int, high: int) -> SpanKey:
-    return (
-        str(request.input_zarr),
-        str(request.resolution),
-        bool(request.depth_axis_first),
-        low,
-        high,
-    )
+def _shared(span: np.ndarray) -> np.ndarray:
+    # later requests share this array, so no engine may change it
+    span.flags.writeable = False
+    return span
 
 
-def _read_span(volume: Any, depth_axis_first: bool, low: int, high: int) -> np.ndarray:
+def span_key(
+    input_zarr: str | Path, resolution: str, depth_axis_first: bool, layer_indices: Any
+) -> tuple[SpanKey, int, int]:
+    """The cache key of the span holding ``layer_indices``, and its bounds."""
+
+    indices = np.asarray(layer_indices, dtype=np.int64)
+    low, high = int(indices.min()), int(indices.max()) + 1
+    return (str(input_zarr), str(resolution), bool(depth_axis_first), low, high), low, high
+
+
+def read_span(volume: Any, depth_axis_first: bool, low: int, high: int) -> np.ndarray:
     """Read layers ``low:high`` as a C-contiguous (Z, H, W) array."""
 
     if depth_axis_first:
@@ -209,13 +234,15 @@ def read_window(request: FlatEngineRequest) -> np.ndarray:
     """
 
     indices = np.asarray(request.layer_indices, dtype=np.int64)
-    low, high = int(indices.min()), int(indices.max()) + 1
+    key, low, high = span_key(
+        request.input_zarr, request.resolution, request.depth_axis_first, indices
+    )
 
     def read() -> np.ndarray:
-        return _read_span(request.volume, request.depth_axis_first, low, high)
+        return read_span(request.volume, request.depth_axis_first, low, high)
 
     cache = request.window_cache
-    span = read() if cache is None else cache.span(_span_key(request, low, high), read)
+    span = read() if cache is None else cache.span(key, read)
     if np.array_equal(indices, np.arange(low, high)):
         # forward order is the span itself; the engine only reads it
         return span
@@ -245,20 +272,7 @@ class InkrsEngine:
     ) -> "InkrsEngine":
         """Check the command, import inkrs and load the checkpoint into it."""
 
-        reasons = []
-        if device.type != "cuda":
-            reasons.append(f"it needs a CUDA device, got {device.type!r}")
-        if len(getattr(args, "gpu_ids", ())) > 1:
-            reasons.append("it runs on one GPU; drop --gpus or pass one id")
-        if getattr(args, "ensemble_checkpoint", None):
-            reasons.append("it does not run --ensemble-checkpoint")
-        if getattr(args, "tta_mirror", False):
-            reasons.append("it does not run --tta-mirror")
-        # --amp-dtype can override the checkpoint's dtype, which is all inkrs
-        # sees; no dtype means torch.autocast's CUDA default, fp16 unless changed
-        amp_dtype = configured_model.amp_dtype or torch.get_autocast_dtype("cuda")
-        if amp_dtype != torch.float16:
-            reasons.append(f"it reproduces fp16 autocast only, got {amp_dtype}")
+        reasons = inkrs_command_reasons(args, configured_model, device)
         if reasons:
             raise EngineUnavailable("; ".join(reasons))
 
@@ -281,10 +295,9 @@ class InkrsEngine:
 
     def unsupported_reason(self, request: FlatEngineRequest) -> str | None:
         # dtype, size and the 4 GiB window limit are inkrs's to judge, in predict
-        if request.blend_mode != INKRS_BLEND_MODE:
-            return f"it blends with Hann only, got {request.blend_mode!r}"
-        if not 1 <= request.stride <= INKRS_MAX_STRIDE:
-            return f"it needs a stride from 1 to {INKRS_MAX_STRIDE}, got {request.stride}"
+        reason = inkrs_tiling_reason(request.blend_mode, request.stride)
+        if reason is not None:
+            return reason
         # villa zero-pads a shallow input to the model depth; inkrs has no padding
         if len(request.layer_indices) != request.input_depth:
             return (
@@ -310,6 +323,41 @@ class InkrsEngine:
             probability=np.asarray(probability, dtype=np.uint8),
             coverage=np.asarray(coverage, dtype=bool),
         )
+
+
+def inkrs_tiling_reason(blend_mode: str, stride: int) -> str | None:
+    """Why inkrs cannot tile with this blend mode and stride, or None when it can."""
+
+    if blend_mode != INKRS_BLEND_MODE:
+        return f"it blends with Hann only, got {blend_mode!r}"
+    if not 1 <= stride <= INKRS_MAX_STRIDE:
+        return f"it needs a stride from 1 to {INKRS_MAX_STRIDE}, got {stride}"
+    return None
+
+
+def inkrs_command_reasons(
+    args: argparse.Namespace, configured_model: Any, device: torch.device
+) -> list[str]:
+    """Why ``--engine inkrs`` cannot run this command at all, from villa's own options.
+
+    Empty when it may run; inkrs then judges the checkpoint, GPU and inputs.
+    """
+
+    reasons = []
+    if device.type != "cuda":
+        reasons.append(f"it needs a CUDA device, got {device.type!r}")
+    if len(getattr(args, "gpu_ids", ())) > 1:
+        reasons.append("it runs on one GPU; drop --gpus or pass one id")
+    if getattr(args, "ensemble_checkpoint", None):
+        reasons.append("it does not run --ensemble-checkpoint")
+    if getattr(args, "tta_mirror", False):
+        reasons.append("it does not run --tta-mirror")
+    # --amp-dtype can override the checkpoint's dtype, which is all inkrs
+    # sees; no dtype means torch.autocast's CUDA default, fp16 unless changed
+    amp_dtype = configured_model.amp_dtype or torch.get_autocast_dtype("cuda")
+    if amp_dtype != torch.float16:
+        reasons.append(f"it reproduces fp16 autocast only, got {amp_dtype}")
+    return reasons
 
 
 def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:
