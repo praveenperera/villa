@@ -522,6 +522,8 @@ uv run --extra models python -m vesuvius.ink_detection.inference.infer_full3d_ti
 | `--chunk-halo` | Occupied-chunk expansion radius, default `1`. |
 | `--write-region` | Write `expanded` chunks by default, or only `occupied` chunks. |
 | `--blend-mode` | `gaussian` by default, or `constant`. |
+| `--blend-device` | `cpu` by default. `cuda` keeps the float32 blend accumulators on the model's GPU and copies back only finished uint8 chunks; it writes the same codes as `cpu`. Needs a CUDA model device. |
+| `--blend-max-gb` | GPU memory cap for `--blend-device cuda` accumulators; chunks past it blend on the host. Default: half the free GPU memory after the first batch. |
 | `--tta` | Average all eight Z/Y/X mirror variants. |
 | `--tta-batch-size` | Maximum variants evaluated together. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |

@@ -684,3 +684,238 @@ def test_injected_command_runtime_writes_then_builds_all_levels(tmp_path, monkey
         np.all(np.asarray(open_group(output)[str(level)]) == 128)
         for level in range(6)
     )
+
+
+def _blend_with(accumulator_factory, *, device):
+    """Blend a tiny synthetic model's patches over a random volume in plan order."""
+
+    shape, chunks, patch = (13, 23, 17), (4, 7, 5), (6, 10, 8)
+    grid = [np.arange(size) + 0.5 for size in shape]
+    z, y, x = (values.ravel() for values in np.meshgrid(*grid, indexing="ij"))
+    plan = _plan(
+        array_shape_zyx=shape,
+        chunk_shape_zyx=chunks,
+        x=x,
+        y=y,
+        z=z,
+        valid=np.ones(z.size, dtype=bool),
+        patch_size_zyx=patch,
+        chunk_halo=0,
+    )
+    generator = torch.Generator().manual_seed(7)
+    volume = torch.rand(shape, generator=generator)
+    model = torch.nn.Conv3d(1, 1, 3, padding=1)
+    with torch.no_grad():
+        model.weight.copy_(torch.randn(model.weight.shape, generator=generator))
+        model.bias.fill_(-0.3)
+    model = model.to(device)
+    output = np.zeros(shape, dtype=np.uint8)
+    weights = native.create_importance_map(patch, mode="gaussian")
+    accumulator = accumulator_factory(output, plan, weights)
+    with torch.inference_mode():
+        for spec in plan.patches:
+            starts = (spec.z0, spec.y0, spec.x0)
+            crop = volume[tuple(slice(s, s + p) for s, p in zip(starts, patch))]
+            probabilities = model(crop[None, None].to(device)).sigmoid()[0, 0]
+            if isinstance(accumulator, native.DeviceChunkAccumulator3D):
+                accumulator.add_patch(patch_start_zyx=starts, probabilities=probabilities)
+            else:
+                accumulator.add_patch(
+                    patch_start_zyx=starts,
+                    probabilities=probabilities.cpu().numpy(),
+                    weights=weights,
+                )
+    accumulator.flush_remaining()
+    assert not accumulator.buffers
+    return output, plan, accumulator
+
+
+def _host_accumulator(output, plan, weights):
+    return native.ChunkAccumulator3D(
+        output=output,
+        target_chunks=set(plan.target_chunks),
+        contribution_counts=plan.contribution_counts,
+        chunk_shape_zyx=plan.chunk_shape_zyx,
+    )
+
+
+def _device_accumulator(device, max_bytes):
+    def factory(output, plan, weights):
+        return native.DeviceChunkAccumulator3D(
+            output=output,
+            target_chunks=set(plan.target_chunks),
+            contribution_counts=plan.contribution_counts,
+            chunk_shape_zyx=plan.chunk_shape_zyx,
+            weights=weights,
+            device=device,
+            max_bytes=max_bytes,
+        )
+
+    return factory
+
+
+# The device blend adds each patch to a voxel in the same order as the host
+# blend and does the same IEEE float32 multiply, add, divide, clip and
+# round-half-even steps (no fused multiply-add), so the uint8 codes must be
+# identical, not merely within one code.
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="needs CUDA"
+            ),
+        ),
+    ],
+)
+def test_device_blend_matches_host_blend_with_host_fallback(device):
+    expected, plan, _ = _blend_with(_host_accumulator, device=device)
+    assert expected.any() and len(plan.patches) > 8
+
+    unlimited, _, accumulator = _blend_with(
+        _device_accumulator(device, 1 << 40), device=device
+    )
+    assert np.array_equal(unlimited, expected)
+    assert accumulator.host_chunks == 0
+    assert accumulator.device_chunks == len(plan.target_chunks)
+    assert accumulator.device_bytes == 0
+
+    # room for the scratch and three 4x7x5 chunks: the rest blend on the host
+    chunk = 4 * 7 * 5
+    budget = 4 * chunk + 3 * 2 * 4 * chunk
+    mixed, _, accumulator = _blend_with(
+        _device_accumulator(device, budget), device=device
+    )
+    assert np.array_equal(mixed, expected)
+    assert accumulator.host_chunks > 0 and accumulator.device_chunks > 0
+    assert accumulator.peak_device_bytes <= budget
+
+
+def test_flushed_device_buffers_are_released_before_the_next_allocation(monkeypatch):
+    import weakref
+
+    flushed = []
+    flush, allocate = (
+        native.DeviceChunkAccumulator3D._flush,
+        native.DeviceChunkAccumulator3D._allocate,
+    )
+
+    def tracking_flush(self, chunk):
+        refs = [weakref.ref(tensor) for tensor in self.buffers[chunk]]
+        flush(self, chunk)
+        flushed.extend(refs)
+
+    def checking_allocate(self, shape):
+        # a live flushed buffer here means device use can pass the budget
+        assert all(ref() is None for ref in flushed)
+        return allocate(self, shape)
+
+    monkeypatch.setattr(native.DeviceChunkAccumulator3D, "_flush", tracking_flush)
+    monkeypatch.setattr(native.DeviceChunkAccumulator3D, "_allocate", checking_allocate)
+    _, plan, accumulator = _blend_with(_device_accumulator("cpu", 1 << 40), device="cpu")
+    assert len(flushed) == 2 * len(plan.target_chunks)
+    assert accumulator.device_chunks == len(plan.target_chunks)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_device_blend_allocates_only_budgeted_buffers(monkeypatch):
+    # finishing a chunk and adding to an existing chunk must not allocate on
+    # the device, so an allocation failure can only hit the guarded path
+    flush, accumulate = (
+        native.DeviceChunkAccumulator3D._flush,
+        native.DeviceChunkAccumulator3D._accumulate,
+    )
+    checked = {"flush": 0, "accumulate": 0}
+
+    def assert_no_allocation(kind, call):
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        call()
+        torch.cuda.synchronize()
+        assert torch.cuda.max_memory_allocated() == before
+        checked[kind] += 1
+
+    def checked_flush(self, chunk):
+        if isinstance(self.buffers[chunk][0], np.ndarray):
+            return flush(self, chunk)
+        assert_no_allocation("flush", lambda: flush(self, chunk))
+
+    def checked_accumulate(self, chunk, *rest):
+        if chunk not in self.buffers:
+            return accumulate(self, chunk, *rest)
+        assert_no_allocation("accumulate", lambda: accumulate(self, chunk, *rest))
+
+    monkeypatch.setattr(native.DeviceChunkAccumulator3D, "_flush", checked_flush)
+    monkeypatch.setattr(native.DeviceChunkAccumulator3D, "_accumulate", checked_accumulate)
+    _blend_with(_device_accumulator("cuda", 1 << 40), device="cuda")
+    assert checked["flush"] > 0 and checked["accumulate"] > 0
+
+
+def test_device_blend_rejects_mismatched_patches_and_non_cuda_models():
+    target = native.ChunkId(0, 0, 0)
+    accumulator = native.DeviceChunkAccumulator3D(
+        output=np.zeros((2, 2, 2), dtype=np.uint8),
+        target_chunks={target},
+        contribution_counts={target: 1},
+        chunk_shape_zyx=(2, 2, 2),
+        weights=np.ones((2, 2, 2), dtype=np.float32),
+        device="cpu",
+        max_bytes=1024,
+    )
+    with pytest.raises(TypeError):
+        accumulator.add_patch(
+            patch_start_zyx=(0, 0, 0),
+            probabilities=torch.zeros((2, 2, 2), dtype=torch.bfloat16),
+        )
+    with pytest.raises(ValueError):
+        accumulator.add_patch(
+            patch_start_zyx=(0, 0, 0), probabilities=torch.zeros((3, 2, 2))
+        )
+    with pytest.raises(ValueError, match="max_bytes is required"):
+        native.DeviceChunkAccumulator3D(
+            output=np.zeros((2, 2, 2), dtype=np.uint8),
+            target_chunks={target},
+            contribution_counts={target: 1},
+            chunk_shape_zyx=(2, 2, 2),
+            weights=np.ones((2, 2, 2), dtype=np.float32),
+            device="cpu",
+        ).add_patch(patch_start_zyx=(0, 0, 0), probabilities=torch.zeros((2, 2, 2)))
+
+    with pytest.raises(ValueError, match="needs a CUDA model device"):
+        native.run_native_inference(
+            args=SimpleNamespace(
+                batch_size=1,
+                gpu_ids=(),
+                num_workers=0,
+                prefetch_factor=2,
+                tta=False,
+                tta_batch_size=None,
+                blend_device="cuda",
+            ),
+            bundle=SimpleNamespace(
+                model=None, device=torch.device("cpu"), amp_dtype=None
+            ),
+            dataset=[],
+            plan=SimpleNamespace(
+                target_chunks=frozenset(),
+                contribution_counts={},
+                chunk_shape_zyx=(2, 2, 2),
+                patch_size_zyx=(2, 2, 2),
+            ),
+            output=np.zeros((2, 2, 2), dtype=np.uint8),
+            importance_map=np.ones((2, 2, 2), dtype=np.float32),
+        )
+
+
+def test_cli_blend_device_flags():
+    args = native.parse_args(["t", "c.pth", "o.zarr"])
+    assert (args.blend_device, args.blend_max_gb) == ("cpu", None)
+    args = native.parse_args(
+        ["t", "c.pth", "o.zarr", "--blend-device", "cuda", "--blend_max_gb", "2.5"]
+    )
+    assert (args.blend_device, args.blend_max_gb) == ("cuda", 2.5)
+    with pytest.raises(SystemExit):
+        native.parse_args(["t", "c.pth", "o.zarr", "--blend-max-gb", "0"])

@@ -57,6 +57,10 @@ LOGGER = logging.getLogger("vesuvius.ink_detection.inference.infer_full3d_tifxyz
 DEFAULT_LEVELS = 6
 DEFAULT_OVERLAP = 0.5
 DEFAULT_PREFETCH_FACTOR = 2
+# share of free device memory the device blend may hold when --blend-max-gb
+# is unset; the rest stays for the model, including a recompile for a last
+# partial batch
+DEVICE_BLEND_AUTO_FRACTION = 0.5
 ARRAY_DIMENSIONS = ["z", "y", "x"]
 
 
@@ -131,6 +135,26 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument(
         "--blend-mode", choices=("gaussian", "constant"), default="gaussian"
     )
+    parser.add_argument(
+        "--blend-device",
+        choices=("cpu", "cuda"),
+        default="cpu",
+        help=(
+            "Where patches are blended into chunks. cuda keeps the float32 "
+            "accumulators on the model's GPU and copies back only finished "
+            "uint8 chunks; it needs a CUDA model device."
+        ),
+    )
+    parser.add_argument(
+        "--blend-max-gb",
+        type=float,
+        default=None,
+        help=(
+            "GPU memory cap for --blend-device cuda accumulators. Chunks past "
+            "it blend on the host. Default: half the free GPU memory after "
+            "the first batch."
+        ),
+    )
     parser.add_argument("--tta", action="store_true")
     parser.add_argument("--tta-batch-size", type=int, default=None)
     parser.add_argument(
@@ -157,6 +181,10 @@ def parse_args(argv: Sequence[str] | None = None):
         (args.num_workers >= 0, "--num-workers must be >= 0"),
         (args.prefetch_factor > 0, "--prefetch-factor must be positive"),
         (args.downsample_workers > 0, "--downsample-workers must be positive"),
+        (
+            args.blend_max_gb is None or args.blend_max_gb > 0,
+            "--blend-max-gb must be positive",
+        ),
         (
             args.tta_batch_size is None or args.tta_batch_size > 0,
             "--tta-batch-size must be positive",
@@ -591,15 +619,15 @@ class ChunkAccumulator3D:
             )
         return self.buffers[chunk]
 
-    def add_patch(
+    def _intersections(
         self,
-        *,
         patch_start_zyx: tuple[int, int, int],
-        probabilities: np.ndarray,
-        weights: np.ndarray,
-    ) -> None:
+        patch_shape_zyx: tuple[int, ...],
+    ):
+        """Yield (chunk, patch slices, chunk slices) for each target chunk a patch touches."""
+
         patch_stop = tuple(
-            patch_start_zyx[axis] + probabilities.shape[axis] for axis in range(3)
+            patch_start_zyx[axis] + patch_shape_zyx[axis] for axis in range(3)
         )
         for chunk in chunks_overlapping_box(
             patch_start_zyx,
@@ -630,22 +658,41 @@ class ChunkAccumulator3D:
                 )
                 for axis in range(3)
             )
+            yield chunk, patch_slices, chunk_slices
+
+    def _count_contribution(self, chunk: ChunkId) -> None:
+        """Flush a chunk once its last planned patch has been added."""
+
+        seen = self.seen_counts.get(chunk, 0) + 1
+        if seen >= self.contribution_counts[chunk]:
+            self._flush(chunk)
+        else:
+            self.seen_counts[chunk] = seen
+
+    def add_patch(
+        self,
+        *,
+        patch_start_zyx: tuple[int, int, int],
+        probabilities: np.ndarray,
+        weights: np.ndarray,
+    ) -> None:
+        for chunk, patch_slices, chunk_slices in self._intersections(
+            patch_start_zyx, probabilities.shape
+        ):
             probability_buffer, weight_buffer = self._buffers(chunk)
             weight_view = weights[patch_slices]
             probability_buffer[chunk_slices] += probabilities[patch_slices] * weight_view
             weight_buffer[chunk_slices] += weight_view
-            seen = self.seen_counts.get(chunk, 0) + 1
-            if seen >= self.contribution_counts[chunk]:
-                self._flush(chunk)
-            else:
-                self.seen_counts[chunk] = seen
+            self._count_contribution(chunk)
 
     def _flush(self, chunk: ChunkId) -> None:
         probability, weight = self.buffers.pop(chunk)
         self.seen_counts.pop(chunk, None)
         np.divide(probability, weight, out=probability, where=weight > 1e-6)
         np.clip(probability, 0.0, 1.0, out=probability)
-        encoded = np.rint(probability * 255.0).astype(np.uint8)
+        self._write(chunk, np.rint(probability * 255.0).astype(np.uint8))
+
+    def _write(self, chunk: ChunkId, encoded: np.ndarray) -> None:
         starts, stops = self._bounds(chunk)
         self.output[
             starts[0] : stops[0], starts[1] : stops[1], starts[2] : stops[2]
@@ -654,6 +701,165 @@ class ChunkAccumulator3D:
     def flush_remaining(self) -> None:
         for chunk in list(self.buffers):
             self._flush(chunk)
+
+
+class DeviceChunkAccumulator3D(ChunkAccumulator3D):
+    """Blend on the model device and copy back only finished uint8 chunks.
+
+    Each voxel sees the same float32 multiply, add and divide steps in the
+    same patch order as ChunkAccumulator3D, so the written codes match the
+    host blend. Device memory stays under ``max_bytes``: the chunk
+    accumulators plus one chunk-sized scratch buffer that holds every
+    temporary, so blending allocates nothing else on the device. A chunk
+    that does not fit accumulates on the host instead.
+    """
+
+    def __init__(
+        self,
+        *,
+        output,
+        target_chunks: set[ChunkId],
+        contribution_counts: dict[ChunkId, int],
+        chunk_shape_zyx: tuple[int, int, int],
+        weights: np.ndarray,
+        device,
+        max_bytes: int | None = None,
+    ) -> None:
+        super().__init__(
+            output=output,
+            target_chunks=target_chunks,
+            contribution_counts=contribution_counts,
+            chunk_shape_zyx=chunk_shape_zyx,
+        )
+        self.device = torch.device(device)
+        self.host_weights = np.ascontiguousarray(weights, dtype=np.float32)
+        self.device_weights = torch.from_numpy(self.host_weights).to(self.device)
+        self.max_bytes = max_bytes
+        self.scratch = None
+        self.device_bytes = 0
+        self.peak_device_bytes = 0
+        self.host_chunks = 0
+        self.device_chunks = 0
+
+    def _device_budget(self) -> int:
+        if self.max_bytes is None:
+            if self.device.type != "cuda":
+                raise ValueError("max_bytes is required for a non-CUDA blend device")
+            # resolved at the first allocation, after the first forward has
+            # claimed the model's activations and any CUDA graph pools; only
+            # driver-free memory counts, since memory cached by the allocator
+            # may belong to a graph pool that eager tensors cannot reuse
+            free, _ = torch.cuda.mem_get_info(self.device)
+            self.max_bytes = int(DEVICE_BLEND_AUTO_FRACTION * free)
+            LOGGER.info("Device blend budget: %.2f GB", self.max_bytes / 1e9)
+        return self.max_bytes
+
+    def _allocate(self, shape: tuple[int, ...]):
+        """Return device accumulators for one chunk, or None if they do not fit."""
+
+        nbytes = 2 * 4 * math.prod(shape)
+        # the scratch holds a float32 product for the largest intersection,
+        # which is at most one full chunk
+        scratch_bytes = 0 if self.scratch is not None else 4 * math.prod(self.chunk_shape_zyx)
+        if self.device_bytes + scratch_bytes + nbytes > self._device_budget():
+            return None
+        try:
+            if self.scratch is None:
+                self.scratch = torch.empty(
+                    math.prod(self.chunk_shape_zyx), dtype=torch.float32, device=self.device
+                )
+                self.device_bytes += scratch_bytes
+            buffers = (
+                torch.zeros(shape, dtype=torch.float32, device=self.device),
+                torch.zeros(shape, dtype=torch.float32, device=self.device),
+            )
+        except torch.cuda.OutOfMemoryError:
+            # the model needs the rest; keep later chunks on the host too
+            self.max_bytes = self.device_bytes
+            return None
+        self.device_bytes += nbytes
+        self.peak_device_bytes = max(self.peak_device_bytes, self.device_bytes)
+        return buffers
+
+    def _buffers(self, chunk: ChunkId):
+        if chunk not in self.buffers:
+            starts, stops = self._bounds(chunk)
+            buffers = self._allocate(
+                tuple(stops[axis] - starts[axis] for axis in range(3))
+            )
+            if buffers is None:
+                self.host_chunks += 1
+                return super()._buffers(chunk)
+            self.buffers[chunk] = buffers
+            self.device_chunks += 1
+        return self.buffers[chunk]
+
+    def add_patch(
+        self,
+        *,
+        patch_start_zyx: tuple[int, int, int],
+        probabilities: torch.Tensor,
+    ) -> None:
+        if probabilities.dtype != torch.float32:
+            raise TypeError(f"Expected float32 probabilities, got {probabilities.dtype}")
+        if tuple(probabilities.shape) != self.host_weights.shape:
+            raise ValueError(
+                f"Probability shape {tuple(probabilities.shape)} does not match "
+                f"blend weights {self.host_weights.shape}"
+            )
+        host = []
+        for chunk, patch_slices, chunk_slices in self._intersections(
+            patch_start_zyx, tuple(probabilities.shape)
+        ):
+            # a helper, so no local reference keeps a flushed chunk's device
+            # buffers alive while the next chunk allocates
+            self._accumulate(chunk, probabilities, host, patch_slices, chunk_slices)
+            self._count_contribution(chunk)
+
+    def _accumulate(self, chunk, probabilities, host, patch_slices, chunk_slices) -> None:
+        probability_buffer, weight_buffer = self._buffers(chunk)
+        if isinstance(probability_buffer, np.ndarray):
+            if not host:
+                host.append(probabilities.cpu().numpy())
+            weight_view = self.host_weights[patch_slices]
+            probability_buffer[chunk_slices] += host[0][patch_slices] * weight_view
+            weight_buffer[chunk_slices] += weight_view
+            return
+        # separate multiply and add, not addcmul_, so no fused multiply-add
+        # changes the float32 rounding against numpy
+        weight_view = self.device_weights[patch_slices]
+        product = self.scratch[: weight_view.numel()].view(weight_view.shape)
+        torch.mul(probabilities[patch_slices], weight_view, out=product)
+        probability_buffer[chunk_slices].add_(product)
+        weight_buffer[chunk_slices].add_(weight_view)
+
+    def _flush(self, chunk: ChunkId) -> None:
+        probability, weight = self.buffers[chunk]
+        if isinstance(probability, np.ndarray):
+            super()._flush(chunk)
+            return
+        count = probability.numel()
+        # mask and codes live in the scratch bytes, so finishing a chunk
+        # allocates nothing on the device
+        scratch = self.scratch.view(torch.uint8)
+        tiny = scratch[:count].view(torch.bool).view(probability.shape)
+        encoded = scratch[count : 2 * count].view(probability.shape)
+        # dividing by exactly 1.0 leaves a value unchanged, which matches the
+        # host blend skipping the divide where the weight is at most 1e-6
+        torch.le(weight, 1e-6, out=tiny)
+        weight.masked_fill_(tiny, 1.0)
+        probability.div_(weight).clamp_(0.0, 1.0).mul_(255.0).round_()
+        encoded.copy_(probability)
+        self._write(chunk, encoded.cpu().numpy())
+        del self.buffers[chunk]
+        self.seen_counts.pop(chunk, None)
+        self.device_bytes -= 2 * 4 * count
+
+    def flush_remaining(self) -> None:
+        super().flush_remaining()
+        if self.scratch is not None:
+            self.device_bytes -= 4 * self.scratch.numel()
+            self.scratch = None
 
 
 def pyramid_shapes(
@@ -952,13 +1158,31 @@ def run_native_inference(
             prefetch_factor=int(args.prefetch_factor),
             multiprocessing_context="spawn",
         )
+    # callers that build args by hand predate --blend-device
+    device_blend = getattr(args, "blend_device", "cpu") == "cuda"
+    if device_blend and bundle.device.type != "cuda":
+        raise ValueError(
+            f"--blend-device cuda needs a CUDA model device, got {bundle.device}"
+        )
     loader = DataLoader(**loader_kwargs)
-    accumulator = ChunkAccumulator3D(
-        output=output,
-        target_chunks=set(plan.target_chunks),
-        contribution_counts=plan.contribution_counts,
-        chunk_shape_zyx=plan.chunk_shape_zyx,
-    )
+    if device_blend:
+        max_gb = getattr(args, "blend_max_gb", None)
+        accumulator = DeviceChunkAccumulator3D(
+            output=output,
+            target_chunks=set(plan.target_chunks),
+            contribution_counts=plan.contribution_counts,
+            chunk_shape_zyx=plan.chunk_shape_zyx,
+            weights=importance_map,
+            device=bundle.device,
+            max_bytes=None if max_gb is None else int(max_gb * 1e9),
+        )
+    else:
+        accumulator = ChunkAccumulator3D(
+            output=output,
+            target_chunks=set(plan.target_chunks),
+            contribution_counts=plan.contribution_counts,
+            chunk_shape_zyx=plan.chunk_shape_zyx,
+        )
     autocast = (
         torch.autocast(
             device_type="cuda", enabled=True, dtype=bundle.amp_dtype
@@ -981,17 +1205,34 @@ def run_native_inference(
                 tta_batch_size=args.tta_batch_size,
                 patch_size_zyx=plan.patch_size_zyx,
             )
-            probability_values = probabilities[:, 0].cpu().numpy()
             metadata_values = metadata.cpu().numpy()
-            for index in range(probability_values.shape[0]):
-                accumulator.add_patch(
-                    patch_start_zyx=tuple(
-                        int(value) for value in metadata_values[index]
-                    ),
-                    probabilities=probability_values[index],
-                    weights=importance_map,
-                )
+            if device_blend:
+                for index in range(probabilities.shape[0]):
+                    accumulator.add_patch(
+                        patch_start_zyx=tuple(
+                            int(value) for value in metadata_values[index]
+                        ),
+                        probabilities=probabilities[index, 0],
+                    )
+            else:
+                probability_values = probabilities[:, 0].cpu().numpy()
+                for index in range(probability_values.shape[0]):
+                    accumulator.add_patch(
+                        patch_start_zyx=tuple(
+                            int(value) for value in metadata_values[index]
+                        ),
+                        probabilities=probability_values[index],
+                        weights=importance_map,
+                    )
     accumulator.flush_remaining()
+    if device_blend:
+        LOGGER.info(
+            "Device blend: %d chunks on %s (peak %.2f GB), %d on the host",
+            accumulator.device_chunks,
+            bundle.device,
+            accumulator.peak_device_bytes / 1e9,
+            accumulator.host_chunks,
+        )
 
 
 def _open_shared_volume(
