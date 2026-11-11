@@ -36,7 +36,6 @@ FALLBACK_CHOICES = ("torch", "error")
 # inkrs.UnsupportedError for what it does not implement; villa checks only its
 # own options, which inkrs never sees
 INKRS_BLEND_MODE = "hann"
-INKRS_MAX_STRIDE = 128
 
 
 class EngineUnavailable(RuntimeError):
@@ -295,7 +294,7 @@ class InkrsEngine:
 
     def unsupported_reason(self, request: FlatEngineRequest) -> str | None:
         # dtype, size and the 4 GiB window limit are inkrs's to judge, in predict
-        reason = inkrs_tiling_reason(request.blend_mode, request.stride)
+        reason = inkrs_tiling_reason(request.blend_mode, request.stride, request.patch_size)
         if reason is not None:
             return reason
         # villa zero-pads a shallow input to the model depth; inkrs has no padding
@@ -325,13 +324,14 @@ class InkrsEngine:
         )
 
 
-def inkrs_tiling_reason(blend_mode: str, stride: int) -> str | None:
+def inkrs_tiling_reason(blend_mode: str, stride: int, patch_size: int) -> str | None:
     """Why inkrs cannot tile with this blend mode and stride, or None when it can."""
 
     if blend_mode != INKRS_BLEND_MODE:
         return f"it blends with Hann only, got {blend_mode!r}"
-    if not 1 <= stride <= INKRS_MAX_STRIDE:
-        return f"it needs a stride from 1 to {INKRS_MAX_STRIDE}, got {stride}"
+    # inkrs tiles at the reader's own patch size (128, or 384 for Reader V3)
+    if not 1 <= stride <= patch_size:
+        return f"it needs a stride from 1 to the patch size {patch_size}, got {stride}"
     return None
 
 

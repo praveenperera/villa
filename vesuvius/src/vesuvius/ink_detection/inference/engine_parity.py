@@ -115,7 +115,7 @@ class TorchStandInEngine:
         volume: np.ndarray,
         windows: Sequence[tuple[int, int]],
         *,
-        stride: int = 64,
+        stride: int | None = None,
         occupancy: Any = "auto",
         coverage: bool = False,
         outputs: Any = None,
@@ -127,6 +127,9 @@ class TorchStandInEngine:
             raise ValueError(f"need a [Z, H, W] volume, got shape {volume.shape}")
         _, height, width = volume.shape
         patch, depth = self.configured.patch_size, self.configured.input_depth
+        # inkrs's default: half the loaded reader's tile edge (64, or 192 for Reader V3)
+        if stride is None:
+            stride = patch // 2
         # the input refusals inkrs documents as UnsupportedError
         if volume.dtype != np.uint8:
             raise TorchStandInUnsupported(f"uint8 volumes only, got {volume.dtype}")

@@ -1624,7 +1624,7 @@ def engine_window_wanted(
         except ValueError:
             # the run itself reports a bad stride or overlap, before any engine
             return False
-        return inkrs_tiling_reason(blend_mode, stride) is None
+        return inkrs_tiling_reason(blend_mode, stride, configured_model.patch_size) is None
     return True
 
 
