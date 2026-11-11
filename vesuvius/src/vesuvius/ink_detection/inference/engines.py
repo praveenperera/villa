@@ -287,7 +287,7 @@ class InkrsEngine:
         device_index = 0 if device.index is None else int(device.index)
         handle = _inkrs_open(module, Path(args.checkpoint), device_index)
         LOGGER.info(
-            "Using the inkrs engine %s on CUDA device %d",
+            "Using the inkrs engine %s on device %d",
             getattr(module, "__version__", "(unknown version)"),
             device_index,
         )
@@ -344,8 +344,9 @@ def inkrs_command_reasons(
     """
 
     reasons = []
-    if device.type != "cuda":
-        reasons.append(f"it needs a CUDA device, got {device.type!r}")
+    # inkrs's macOS build runs on Metal, which villa reaches as the MPS device
+    if device.type not in ("cuda", "mps"):
+        reasons.append(f"it needs a CUDA device, or MPS on macOS, got {device.type!r}")
     if len(getattr(args, "gpu_ids", ())) > 1:
         reasons.append("it runs on one GPU; drop --gpus or pass one id")
     if getattr(args, "ensemble_checkpoint", None):
@@ -373,7 +374,7 @@ def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:
         return module.Engine(checkpoint, device=device_index)
     except module.UnsupportedError as exc:
         raise EngineUnavailable(
-            f"inkrs cannot load {checkpoint.name} on CUDA device {device_index}: {exc}"
+            f"inkrs cannot load {checkpoint.name} on device {device_index}: {exc}"
         ) from exc
 
 

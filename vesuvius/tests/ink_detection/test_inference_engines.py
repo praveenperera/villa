@@ -340,7 +340,7 @@ def test_inkrs_load_falls_back_only_when_inkrs_calls_it_unsupported(
             _engine_args(tmp_path), _inkrs_shaped_model(), torch.device("cuda", 0)
         )
     assert engine is None
-    assert "inkrs cannot load m.pth on CUDA device 0" in caplog.text
+    assert "inkrs cannot load m.pth on device 0" in caplog.text
     assert "hybrid_3d2d-seed42 contract" in caplog.text
 
     def broken(checkpoint, *, device):
@@ -497,6 +497,8 @@ def test_window_read_ahead_only_for_runs_inkrs_would_take(tmp_path, monkeypatch)
 
     monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(None))
     assert wanted("--blend-mode", "hann", "--stride", "64")
+    # inkrs's macOS build runs on Metal through villa's MPS device
+    assert wanted("--blend-mode", "hann", "--stride", "64", device=torch.device("mps"))
     # every refusal inkrs or villa would make before a request leaves the read undone
     assert not wanted("--blend-mode", "constant", "--stride", "64")
     assert not wanted("--blend-mode", "hann", "--stride", "999")
