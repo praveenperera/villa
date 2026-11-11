@@ -1085,12 +1085,13 @@ class NativePatchDataset(Dataset):
             crop[valid_slices] = normalize_image(
                 crop[valid_slices], self.normalization
             )
-        channels = [crop]
         if self.mode == "full_3d_single_wrap":
-            channels.append(self._surface_mask(bbox))
-        image = torch.from_numpy(
-            np.ascontiguousarray(np.stack(channels, axis=0))
-        ).float()
+            image = np.stack([crop, self._surface_mask(bbox)], axis=0)
+        else:
+            # a view, not np.stack: copying a 256^3 float32 patch took about
+            # a fifth of a worker's time per patch
+            image = crop[None]
+        image = torch.from_numpy(np.ascontiguousarray(image)).float()
         return image, torch.tensor(starts, dtype=torch.int64)
 
 
