@@ -6,10 +6,12 @@ from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
 import functools
+import importlib.util
 import json
 import logging
 import math
 import shutil
+import sys
 import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -42,7 +44,11 @@ from vesuvius.ink_detection.inference.engines import (
     WindowCache,
     add_engine_arguments,
     decline_request,
+    inkrs_command_reasons,
+    inkrs_tiling_reason,
+    read_span,
     select_engine,
+    span_key,
 )
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
@@ -208,6 +214,20 @@ def compute_importance_map_2d(
     )
     weight /= torch.clamp(weight.max(), min=torch.finfo(weight.dtype).eps)
     return torch.clamp(weight, min=torch.finfo(weight.dtype).eps)
+
+
+def resolve_tiling(args: argparse.Namespace, patch_size: int) -> tuple[int, str]:
+    """The stride and blend mode a run tiles with, from ``--stride``/``--overlap`` and ``--blend-mode``."""
+
+    stride = resolve_patch_stride(
+        patch_size=patch_size,
+        overlap=args.overlap,
+        explicit_stride=args.stride,
+    )
+    blend_mode = str(args.blend_mode)
+    if blend_mode == "auto":
+        blend_mode = "constant" if stride >= patch_size else "hann"
+    return stride, blend_mode
 
 
 def resolve_patch_stride(
@@ -1337,14 +1357,7 @@ def infer_single_zarr(
     r0, r1, c0, c1 = output_bounds
     output_shape = (r1 - r0, c1 - c0)
     patch_size = configured_model.patch_size
-    stride = resolve_patch_stride(
-        patch_size=patch_size,
-        overlap=args.overlap,
-        explicit_stride=args.stride,
-    )
-    blend_mode = str(args.blend_mode)
-    if blend_mode == "auto":
-        blend_mode = "constant" if stride >= patch_size else "hann"
+    stride, blend_mode = resolve_tiling(args, patch_size)
     tile_shape = (patch_size, patch_size)
     if patch_size % 16:
         tile_shape = (chunk_h, chunk_w)
@@ -1574,6 +1587,73 @@ def infer_single_zarr(
             }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _inkrs_importable() -> bool:
+    # sys.modules first: a module put there by hand has no spec, which find_spec rejects
+    if "inkrs" in sys.modules:
+        return sys.modules["inkrs"] is not None
+    try:
+        return importlib.util.find_spec("inkrs") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def engine_window_wanted(
+    args: argparse.Namespace,
+    configured_model: ConfiguredModel,
+    device: torch.device,
+    engine_factory: EngineFactory | None,
+) -> bool:
+    """Whether to read a single input's window ahead for the engine.
+
+    Not for folder runs, nor for inputs every engine declines (an ROI or a
+    mask), nor when ``--engine inkrs`` will refuse the command or its tiling.
+    """
+
+    if args.folder is not None or getattr(args, "roi", None) is not None:
+        return False
+    if getattr(args, "mask_path", None) is not None:
+        return False
+    if engine_factory is None and str(getattr(args, "engine", "torch")) == "inkrs":
+        if not _inkrs_importable() or inkrs_command_reasons(args, configured_model, device):
+            return False
+        try:
+            stride, blend_mode = resolve_tiling(args, configured_model.patch_size)
+        except ValueError:
+            # the run itself reports a bad stride or overlap, before any engine
+            return False
+        return inkrs_tiling_reason(blend_mode, stride) is None
+    return True
+
+
+def prefetch_engine_window(
+    args: argparse.Namespace, configured_model: ConfiguredModel, cache: WindowCache
+) -> None:
+    """Start reading a single input's source layers on a thread.
+
+    The read then overlaps the engine's load, and the engine's first request
+    takes the span from ``cache``. It selects the level and layers as
+    ``infer_single_zarr`` does for the first direction; anything it cannot
+    work out is left to that run, which reports it in order.
+    """
+
+    try:
+        root = open_volume_root(args.input_zarr)
+        resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+        volume = select_volume_level(root, resolution, source=str(args.input_zarr))
+        depth_first, depth, *_ = _volume_axes(volume)
+        layer_indices = select_layer_indices(
+            depth,
+            layer_start=args.layer_start,
+            layer_end=args.layer_end,
+            output_depth=configured_model.input_depth,
+            direction=resolve_run_directions(args.direction)[0],
+        )
+    except Exception:
+        return
+    key, low, high = span_key(args.input_zarr, resolution, depth_first, layer_indices)
+    cache.prefetch(key, lambda: read_span(volume, depth_first, low, high))
 
 
 def run_with_engine(
@@ -1884,6 +1964,64 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run(normalize_inference_paths(parse_args(argv)))
 
 
+def run_inputs(
+    args: argparse.Namespace,
+    configured: ConfiguredModel,
+    device: torch.device,
+    engine_factory: EngineFactory | None,
+    window_cache: WindowCache,
+) -> None:
+    """Select the engine, then run every input and direction."""
+
+    # the closure holds the bare model, not `configured`, which will hold the
+    # closure and the engine; that cycle would keep the engine's GPU memory
+    # alive after run() returns, until the next full garbage collection
+    source_model = configured.model
+
+    def prepare() -> nn.Module:
+        model = source_model
+        if model is None:
+            model = configure_model(args).model
+        model, _ = prepare_model_for_inference(
+            model,
+            gpu_ids=args.gpu_ids,
+            device_type=args.device,
+            device=device,
+            compile_model=args.compile_model,
+            compile_mode=args.compile_mode,
+        )
+        return model
+
+    engine = select_engine(args, configured, device, factory=engine_factory)
+    if engine is None:
+        # PyTorch runs everything, so a span read ahead is not kept for the run
+        window_cache.close()
+        configured = replace(configured, model=prepare())
+    else:
+        configured = replace(
+            configured,
+            engine=engine,
+            prepare_model=functools.cache(prepare),
+            window_cache=window_cache,
+        )
+    if args.folder is not None:
+        infer_folder(args, configured, device=device)
+    else:
+        for direction in resolve_run_directions(args.direction):
+            infer_single_zarr(
+                args=args,
+                input_zarr=args.input_zarr,
+                configured_model=configured,
+                device=device,
+                output_tiff=resolve_single_output_path(
+                    args.output_tiff,
+                    direction=direction,
+                    requested_direction=args.direction,
+                ),
+                layer_direction=direction,
+            )
+
+
 def run(
     args: argparse.Namespace, *, engine_factory: EngineFactory | None = None
 ) -> int:
@@ -1906,51 +2044,15 @@ def run(
     )
     configured = configure_model(args, build_model=not engine_requested)
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
-    # the closure holds the bare model, not `configured`, which will hold the
-    # closure and the engine; that cycle would keep the engine's GPU memory
-    # alive after run() returns, until the next full garbage collection
-    source_model = configured.model
-
-    def prepare() -> nn.Module:
-        model = source_model
-        if model is None:
-            model = configure_model(args).model
-        model, _ = prepare_model_for_inference(
-            model,
-            gpu_ids=args.gpu_ids,
-            device_type=args.device,
-            device=device,
-            compile_model=args.compile_model,
-            compile_mode=args.compile_mode,
-        )
-        return model
-
-    engine = select_engine(args, configured, device, factory=engine_factory)
-    if engine is None:
-        configured = replace(configured, model=prepare())
-    else:
-        configured = replace(
-            configured,
-            engine=engine,
-            prepare_model=functools.cache(prepare),
-            window_cache=WindowCache(),
-        )
-    if args.folder is not None:
-        infer_folder(args, configured, device=device)
-    else:
-        for direction in resolve_run_directions(args.direction):
-            infer_single_zarr(
-                args=args,
-                input_zarr=args.input_zarr,
-                configured_model=configured,
-                device=device,
-                output_tiff=resolve_single_output_path(
-                    args.output_tiff,
-                    direction=direction,
-                    requested_direction=args.direction,
-                ),
-                layer_direction=direction,
-            )
+    window_cache = WindowCache()
+    if engine_requested and engine_window_wanted(args, configured, device, engine_factory):
+        # the zarr read runs while the engine loads, which releases the GIL
+        prefetch_engine_window(args, configured, window_cache)
+    try:
+        run_inputs(args, configured, device, engine_factory, window_cache)
+    finally:
+        # a read ahead never outlives the run, whatever ended it
+        window_cache.close()
     return 0
 
 

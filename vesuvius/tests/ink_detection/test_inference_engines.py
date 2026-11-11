@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import json
 import sys
+import threading
 import weakref
 from types import SimpleNamespace
 
@@ -253,15 +254,21 @@ def test_inkrs_refuses_unsupported_models_and_options_before_importing(tmp_path,
     assert "not installed" not in message
 
 
-def test_cpu_run_requesting_inkrs_writes_the_pytorch_map(tmp_path, caplog):
+def test_cpu_run_requesting_inkrs_writes_the_pytorch_map(tmp_path, monkeypatch, caplog):
+    from vesuvius.ink_detection.inference import infer
+
     surface, _ = _write_surface(tmp_path / "surface.zarr")
     checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    # inkrs importable, so only the CPU refusal can stop the read ahead
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(None))
+    reads = []
+    monkeypatch.setattr(infer, "read_span", lambda *a: reads.append(a))
 
-    assert main([str(surface), str(checkpoint), str(tmp_path / "torch.tif"), *COMMON]) == 0
+    assert main([str(surface), str(checkpoint), str(tmp_path / "torch.tif"), *COMMON, "--device", "cpu"]) == 0
     with caplog.at_level("WARNING"):
         assert (
             main(
-                [str(surface), str(checkpoint), str(tmp_path / "inkrs.tif"), *COMMON, "--engine", "inkrs"]
+                [str(surface), str(checkpoint), str(tmp_path / "inkrs.tif"), *COMMON, "--device", "cpu", "--engine", "inkrs"]
             )
             == 0
         )
@@ -269,6 +276,8 @@ def test_cpu_run_requesting_inkrs_writes_the_pytorch_map(tmp_path, caplog):
     np.testing.assert_array_equal(
         tifffile.imread(tmp_path / "inkrs.tif"), tifffile.imread(tmp_path / "torch.tif")
     )
+    # a command inkrs refuses reads nothing ahead for it
+    assert reads == []
 
     with pytest.raises(EngineUnavailable):
         main(
@@ -276,7 +285,7 @@ def test_cpu_run_requesting_inkrs_writes_the_pytorch_map(tmp_path, caplog):
                 str(surface),
                 str(checkpoint),
                 str(tmp_path / "strict.tif"),
-                *COMMON,
+                *COMMON, "--device", "cpu",
                 "--engine",
                 "inkrs",
                 "--engine-fallback",
@@ -433,14 +442,32 @@ def test_inkrs_adapter_sends_layers_in_model_order_and_villas_occupancy(tmp_path
     assert (tifffile.imread(tmp_path / "out.tif") == 9).all()
 
 
-def test_both_directions_read_the_source_layers_once(tmp_path, monkeypatch):
+def test_both_directions_read_the_source_layers_once_beside_the_engine_load(
+    tmp_path, monkeypatch
+):
+    from vesuvius.ink_detection.inference import infer
+
     surface, volume = _write_surface(tmp_path / "surface.zarr")
     checkpoint = _save_checkpoint(tmp_path / "model.pth")
     reads = []
-    real_read = engines._read_span
-    monkeypatch.setattr(
-        engines, "_read_span", lambda *a: reads.append(a[2:]) or real_read(*a)
-    )
+    real_read = engines.read_span
+    read_started, load_done = threading.Event(), threading.Event()
+
+    def recording_read(*a):
+        reads.append((threading.current_thread().name, a[2:]))
+        read_started.set()
+        # the read finishes only once the engine has loaded, so a run that read
+        # before or after the load, not during it, times out here or below
+        assert load_done.wait(10), "the engine never loaded while the read waited"
+        return real_read(*a)
+
+    def load(*_):
+        assert read_started.wait(10), "the read did not start before the engine load"
+        load_done.set()
+        return engine
+
+    monkeypatch.setattr(engines, "read_span", recording_read)
+    monkeypatch.setattr(infer, "read_span", recording_read)
     handle = _RecordingHandle()
     engine = InkrsEngine(_fake_inkrs(None), handle, device_index=0)
     args = normalize_inference_paths(
@@ -450,12 +477,34 @@ def test_both_directions_read_the_source_layers_once(tmp_path, monkeypatch):
         )
     )
 
-    assert run(args, engine_factory=lambda *_: engine) == 0
+    assert run(args, engine_factory=load) == 0
 
-    assert reads == [(1, 4)]
+    # one read, on a thread, spanning the engine load
+    assert reads == [("engine-window-prefetch", (1, 4))]
+    assert not any(t.name == "engine-window-prefetch" for t in threading.enumerate())
     [forward, reverse] = [call[0] for call in handle.calls]
     np.testing.assert_array_equal(forward, volume[[1, 2, 3]])
     np.testing.assert_array_equal(reverse, volume[[3, 2, 1]])
+
+
+def test_window_read_ahead_only_for_runs_inkrs_would_take(tmp_path, monkeypatch):
+    from vesuvius.ink_detection.inference.infer import engine_window_wanted
+
+    model, cuda = _inkrs_shaped_model(), torch.device("cuda", 0)
+
+    def wanted(*extra, device=cuda):
+        return engine_window_wanted(_engine_args(tmp_path, *extra), model, device, None)
+
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(None))
+    assert wanted("--blend-mode", "hann", "--stride", "64")
+    # every refusal inkrs or villa would make before a request leaves the read undone
+    assert not wanted("--blend-mode", "constant", "--stride", "64")
+    assert not wanted("--blend-mode", "hann", "--stride", "999")
+    assert not wanted("--blend-mode", "hann", "--roi", "0", "1", "0", "1")
+    assert not wanted("--blend-mode", "hann", "--tta-mirror")
+    assert not wanted("--blend-mode", "hann", device=torch.device("cpu"))
+    monkeypatch.setitem(sys.modules, "inkrs", None)
+    assert not wanted("--blend-mode", "hann", "--stride", "64")
 
 
 def test_window_cache_keeps_one_span_and_never_a_failed_read():
@@ -468,7 +517,8 @@ def test_window_cache_keeps_one_span_and_never_a_failed_read():
             return np.full((1, 2, 2), value, np.uint8)
         return inner
 
-    first = cache.span(("a", "0", True, 0, 1), read(1))
+    cache.prefetch(("a", "0", True, 0, 1), read(1))
+    first = cache.span(("a", "0", True, 0, 1), read(2))
     assert cache.span(("a", "0", True, 0, 1), read(2)) is first
     # the shared span is read-only, so one engine cannot change another's input
     assert not first.flags.writeable
@@ -482,6 +532,23 @@ def test_window_cache_keeps_one_span_and_never_a_failed_read():
     with pytest.raises(OSError):
         cache.span(("c", "0", True, 0, 1), broken)
     assert (cache.span(("c", "0", True, 0, 1), read(5)) == 5).all()
+    # a failed read ahead is read again by the request, which then owns any error
+    cache.prefetch(("d", "0", True, 0, 1), broken)
+    assert (cache.span(("d", "0", True, 0, 1), read(6)) == 6).all()
+    assert calls == [1, 3, 4, 5, 6]
+
+    # close waits for a read ahead nobody asked for and keeps nothing
+    release = threading.Event()
+
+    def slow():
+        release.wait(10)
+        return read(7)()
+
+    cache.prefetch(("e", "0", True, 0, 1), slow)
+    threading.Timer(0.05, release.set).start()
+    cache.close()
+    assert calls[-1] == 7
+    assert (cache.span(("e", "0", True, 0, 1), read(8)) == 8).all()
 
 
 def test_engine_shape_mismatch_is_an_error_not_a_written_map(tmp_path):
