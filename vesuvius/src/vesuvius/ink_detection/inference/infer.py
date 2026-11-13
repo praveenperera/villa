@@ -1655,6 +1655,8 @@ def prefetch_engine_window(
     except Exception:
         return
     # inkrs is the only engine; a window it will decline is not read ahead
+    if len(layer_indices) != configured_model.input_depth:
+        return
     if inkrs_window_reason(
         volume, configured_model.input_depth, height, width, configured_model.patch_size
     ) is not None:

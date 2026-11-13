@@ -371,6 +371,11 @@ def inkrs_command_reasons(
     """
 
     reasons = []
+    # inkrs exports a .pth itself and reads any other path as its own
+    # safetensors export, which no checkpoint villa loads is
+    checkpoint = Path(args.checkpoint)
+    if checkpoint.suffix != ".pth":
+        reasons.append(f"it loads .pth checkpoints only, got {checkpoint.name}")
     # inkrs's macOS build runs on Metal, which villa reaches as the MPS device
     if device.type not in ("cuda", "mps"):
         reasons.append(f"it needs a CUDA device, or MPS on macOS, got {device.type!r}")

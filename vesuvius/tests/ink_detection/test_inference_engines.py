@@ -255,21 +255,26 @@ def test_inkrs_refuses_unsupported_models_and_options_before_importing(tmp_path,
 
 
 @pytest.mark.parametrize(
-    ("extra", "reason"),
+    ("checkpoint", "extra", "reason"),
     [
-        (("--roi", "0", "8", "0", "8"), "it does not crop to --roi"),
-        (("--mask-path", "mask.png"), "it does not apply --mask-path"),
-        (("--blend-mode", "gaussian"), "it blends with Hann only, got 'gaussian'"),
+        ("m.pth", ("--roi", "0", "8", "0", "8"), "it does not crop to --roi"),
+        ("m.pth", ("--mask-path", "mask.png"), "it does not apply --mask-path"),
+        ("m.pth", ("--blend-mode", "gaussian"), "it blends with Hann only, got 'gaussian'"),
+        # inkrs would read any other path as its own safetensors export and fail, not decline
+        ("m.pt", (), "it loads .pth checkpoints only, got m.pt"),
     ],
 )
-def test_inkrs_declines_roi_mask_and_blending_without_loading(tmp_path, monkeypatch, caplog, extra, reason):
+def test_inkrs_declines_whole_commands_without_loading(tmp_path, monkeypatch, caplog, checkpoint, extra, reason):
     # these hold for every input, so loading inkrs for them would only take GPU memory PyTorch needs
     def never_load(checkpoint, *, device):
         raise AssertionError("inkrs loaded for a command it declines")
 
     monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(never_load))
+    args = normalize_inference_paths(
+        parse_args(["in.zarr", str(tmp_path / checkpoint), "out.tif", "--engine", "inkrs", *extra])
+    )
     with caplog.at_level("WARNING"):
-        engine = select_engine(_engine_args(tmp_path, *extra), _inkrs_shaped_model(), torch.device("cuda", 0))
+        engine = select_engine(args, _inkrs_shaped_model(), torch.device("cuda", 0))
     assert engine is None
     assert reason in caplog.text
 
@@ -572,8 +577,10 @@ def test_inkrs_declines_windows_it_cannot_take_before_reading_them(tmp_path, mon
         patch_size=SIDE, stride=SIDE // 2, blend_mode="hann", preprocessing="tifxyz_robust", blocks=(),
     )
     assert engine.unsupported_reason(request) == "its 3-layer window of 4320000000 bytes is 4 GiB or more"
+    # a 2-layer input is shallower than the 3-layer model, so the engine declines it too
+    _write_surface(tmp_path / "shallow.zarr", layers=2)
     model = _inkrs_shaped_model(input_depth=DEPTH, patch_size=SIDE)
-    for surface in ("big.zarr", "u8.zarr"):
+    for surface in ("big.zarr", "shallow.zarr", "u8.zarr"):
         cache = WindowCache()
         args = normalize_inference_paths(
             parse_args([str(tmp_path / surface), str(checkpoint), "out.tif", "--engine", "inkrs"])
@@ -587,6 +594,37 @@ def test_inkrs_declines_windows_it_cannot_take_before_reading_them(tmp_path, mon
         "the input's 40x15 layers are smaller than one 16 px tile"
     )
     assert engines.inkrs_window_reason(narrow, DEPTH, SIDE, SIDE, SIDE) is None
+
+
+def test_folder_runs_load_the_engine_once_and_fall_back_per_segment(tmp_path, monkeypatch):
+    # one uint8 segment runs on the engine and one uint16 segment falls back to PyTorch, in one folder run
+    _, volume = _write_surface(tmp_path / "u8.zarr")
+    folder = tmp_path / "segments"
+    _write_surface(folder / "a" / "a.zarr")
+    (folder / "b").mkdir(parents=True)
+    ZarrWriter.create(folder / "b" / "b.zarr", shape=volume.shape, chunks=(volume.shape[0], 16, 16), dtype="u2")[:] = (
+        volume.astype(np.uint16) * 200
+    )
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    loads, handle = [], _RecordingHandle()
+
+    def factory(*_):
+        loads.append(1)
+        return InkrsEngine(_fake_inkrs(None), handle, device_index=0)
+
+    args = normalize_inference_paths(parse_args(["--folder", str(folder), str(checkpoint), *COMMON, "--direction", "both"]))
+    assert run(args, engine_factory=factory) == 0
+    assert main([str(folder / "b" / "b.zarr"), str(checkpoint), str(tmp_path / "torch.tif"), *COMMON]) == 0
+
+    assert loads == [1]
+    # segment a's two directions went to the engine, in model order, and b's to neither
+    [forward, reverse] = [call[0] for call in handle.calls]
+    np.testing.assert_array_equal(reverse, forward[::-1])
+    for direction in ("forward", "reverse"):
+        [a_map] = (folder / "a" / "preds").glob(f"a_model_{direction}_*.tif")
+        assert (tifffile.imread(a_map) == 9).all()
+    [b_forward] = (folder / "b" / "preds").glob("b_model_forward_*.tif")
+    np.testing.assert_array_equal(tifffile.imread(b_forward), tifffile.imread(tmp_path / "torch.tif"))
 
 
 def test_window_cache_keeps_one_span_and_never_a_failed_read():

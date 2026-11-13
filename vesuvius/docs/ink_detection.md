@@ -520,11 +520,15 @@ options inkrs never sees:
 - fp16 autocast (PyTorch's CUDA default, so `--amp-dtype default` qualifies)
 - Hann blending (the default with overlap) and a stride from 1 to the tile
   size (128, or 384 for Reader V3)
+- a `.pth` checkpoint
 - at least 17 layers in the input
 - no `--mask-path`, `--roi`, `--tta-mirror` or `--ensemble-checkpoint`
 
 Other inkrs errors, such as missing CUDA libraries or running out of GPU
-memory, stop the command rather than fall back.
+memory, stop the command rather than fall back. So does a failed export: inkrs
+loads the checkpoint's weights strictly when it exports them, so a checkpoint
+that villa loads with missing or unexpected keys stops with inkrs's export
+error. Run such a checkpoint with the default engine.
 
 Each map matches PyTorch's to within 4/255, with the same covered pixels.
 To check that on your own data and GPU, run both engines and compare them:
