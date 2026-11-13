@@ -1421,6 +1421,8 @@ def build_parser():
                         help='With --blend_in_memory: finalization mode, as in blend_and_finalize. Default: binary')
     from vesuvius.models.run.finalize_outputs import add_threshold_arguments
     add_threshold_arguments(parser)
+    from vesuvius.models.run.inkrs_engine import add_engine_arguments
+    add_engine_arguments(parser)
     parser.add_argument('--blend_sigma_scale', type=float, default=8.0,
                         help='With --blend_in_memory: Gaussian sigma = patch_size / blend_sigma_scale, '
                              'as blend_and_finalize --sigma_scale. Default: 8.0')
@@ -1483,6 +1485,15 @@ def main():
             'compression_level': args.blend_compression_level,
             'finalize_config': FinalizeConfig(mode=args.mode, threshold=resolve_threshold(parser, args)),
         }
+
+    if args.engine == 'inkrs':
+        from vesuvius.models.run import inkrs_engine
+        threshold = in_memory_blend['finalize_config'].threshold if in_memory_blend else None
+        output_path = inkrs_engine.predict(args, threshold)
+        if output_path is not None:
+            print("\n--- Inference Finished ---")
+            print(f"Blended output written to: {output_path}")
+            return 0
 
     print("\n--- Initializing Inferer ---")
     inferer = Inferer(
