@@ -33,9 +33,10 @@ ENGINE_CHOICES = ("torch", "inkrs")
 FALLBACK_CHOICES = ("torch", "error")
 
 # inkrs judges the checkpoint, the volume and the GPU itself and raises
-# inkrs.UnsupportedError for what it does not implement; villa checks only its
-# own options, which inkrs never sees
+# inkrs.UnsupportedError for what it does not implement; villa checks its own
+# options, which inkrs never sees, and the window limits before reading one
 INKRS_BLEND_MODE = "hann"
+INKRS_MAX_WINDOW_BYTES = 2**32 - 1
 
 
 class EngineUnavailable(RuntimeError):
@@ -294,7 +295,6 @@ class InkrsEngine:
         return cls(module, handle, device_index=device_index)
 
     def unsupported_reason(self, request: FlatEngineRequest) -> str | None:
-        # dtype, size and the 4 GiB window limit are inkrs's to judge, in predict
         reason = inkrs_tiling_reason(request.blend_mode, request.stride, request.patch_size)
         if reason is not None:
             return reason
@@ -304,7 +304,9 @@ class InkrsEngine:
                 f"it needs exactly {request.input_depth} source layers, got "
                 f"{len(request.layer_indices)} (the input is shallower than the model)"
             )
-        return None
+        return inkrs_window_reason(
+            request.volume, request.input_depth, request.height, request.width, request.patch_size
+        )
 
     def predict(self, request: FlatEngineRequest) -> FlatEngineResult:
         started = time.perf_counter()
@@ -333,6 +335,29 @@ def inkrs_tiling_reason(blend_mode: str, stride: int, patch_size: int) -> str | 
     # inkrs tiles at the reader's own patch size (128, or 384 for Reader V3)
     if not 1 <= stride <= patch_size:
         return f"it needs a stride from 1 to the patch size {patch_size}, got {stride}"
+    return None
+
+
+def inkrs_window_reason(
+    volume: Any, depth: int, height: int, width: int, patch_size: int
+) -> str | None:
+    """Why inkrs cannot take a ``depth``-layer window of ``volume``, or None when it can.
+
+    It judges from the volume's metadata alone, so villa can decline a window
+    before reading it: inkrs makes the same checks, but only once it has the
+    window in memory, which for an oversized input may not fit.
+    """
+
+    # inkrs's documented input limits: uint8 layers, each side at least one
+    # tile, and a window under 4 GiB, since its kernels index it with u32
+    dtype = getattr(volume, "dtype", None)
+    if dtype is not None and np.dtype(dtype) != np.uint8:
+        return f"it reads uint8 volumes only, got {np.dtype(dtype)}"
+    if min(height, width) < patch_size:
+        return f"the input's {height}x{width} layers are smaller than one {patch_size} px tile"
+    window_bytes = int(depth) * int(height) * int(width)
+    if window_bytes >= INKRS_MAX_WINDOW_BYTES:
+        return f"its {depth}-layer window of {window_bytes} bytes is 4 GiB or more"
     return None
 
 

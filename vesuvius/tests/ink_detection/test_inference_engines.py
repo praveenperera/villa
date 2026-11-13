@@ -509,6 +509,66 @@ def test_window_read_ahead_only_for_runs_inkrs_would_take(tmp_path, monkeypatch)
     assert not wanted("--blend-mode", "hann", "--stride", "64")
 
 
+def test_inkrs_declines_windows_it_cannot_take_before_reading_them(tmp_path, monkeypatch, caplog):
+    # inkrs checks dtype, size and the 4 GiB limit only once it has the window in memory, so villa
+    # applies the same limits from metadata first; an oversized input must never be read whole
+    from vesuvius.ink_detection.inference import infer
+    from vesuvius.ink_detection.inference.engines import FlatEngineRequest
+
+    reads = []
+    real_read = engines.read_span
+
+    def recording_read(*a):
+        reads.append(a[2:])
+        return real_read(*a)
+
+    monkeypatch.setattr(engines, "read_span", recording_read)
+    monkeypatch.setattr(infer, "read_span", recording_read)
+    handle = _RecordingHandle()
+    engine = InkrsEngine(_fake_inkrs(None), handle, device_index=0)
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+
+    # a uint16 input runs on PyTorch with neither the read ahead nor the request reading it
+    _, volume = _write_surface(tmp_path / "u8.zarr")
+    wide = tmp_path / "u16.zarr"
+    ZarrWriter.create(wide, shape=volume.shape, chunks=(volume.shape[0], 16, 16), dtype="u2")[:] = (
+        volume.astype(np.uint16) * 200
+    )
+    assert main([str(wide), str(checkpoint), str(tmp_path / "torch.tif"), *COMMON]) == 0
+    args = normalize_inference_paths(parse_args([str(wide), str(checkpoint), str(tmp_path / "engine.tif"), *COMMON]))
+    with caplog.at_level("WARNING"):
+        assert run(args, engine_factory=lambda *_: engine) == 0
+    assert "it reads uint8 volumes only, got uint16" in caplog.text
+    assert reads == [] and handle.calls == []
+    np.testing.assert_array_equal(
+        tifffile.imread(tmp_path / "engine.tif"), tifffile.imread(tmp_path / "torch.tif")
+    )
+
+    # 3 x 40000 x 36000 bytes is just over 4 GiB; with no chunk written it takes no disk
+    big = ZarrWriter.create(tmp_path / "big.zarr", shape=(DEPTH, 40000, 36000), chunks=(DEPTH, 1024, 1024), dtype="u1")
+    request = FlatEngineRequest(
+        input_zarr=tmp_path / "big.zarr", resolution="0", volume=big, depth_axis_first=True,
+        height=40000, width=36000, layer_indices=np.arange(DEPTH), input_depth=DEPTH,
+        patch_size=SIDE, stride=SIDE // 2, blend_mode="hann", preprocessing="tifxyz_robust", blocks=(),
+    )
+    assert engine.unsupported_reason(request) == "its 3-layer window of 4320000000 bytes is 4 GiB or more"
+    model = _inkrs_shaped_model(input_depth=DEPTH, patch_size=SIDE)
+    for surface in ("big.zarr", "u8.zarr"):
+        cache = WindowCache()
+        args = normalize_inference_paths(
+            parse_args([str(tmp_path / surface), str(checkpoint), "out.tif", "--engine", "inkrs"])
+        )
+        infer.prefetch_engine_window(args, model, cache)
+        cache.close()
+    # only the small uint8 input was read ahead
+    assert reads == [(1, 4)]
+    narrow = SimpleNamespace(dtype=np.dtype("u1"))
+    assert engines.inkrs_window_reason(narrow, DEPTH, 40, SIDE - 1, SIDE) == (
+        "the input's 40x15 layers are smaller than one 16 px tile"
+    )
+    assert engines.inkrs_window_reason(narrow, DEPTH, SIDE, SIDE, SIDE) is None
+
+
 def test_window_cache_keeps_one_span_and_never_a_failed_read():
     cache = WindowCache()
     calls = []
@@ -758,8 +818,10 @@ def test_layer_starts_write_each_single_window_runs_bytes_with_one_load(tmp_path
 
     infer(tmp_path / "multi" / "map.tif", "--layer-starts", "2,0,1")
     multi_loads = len(loads)
-    # one reference contract read; PyTorch prepares its model once, the engine path never
-    assert builds == ["configure_model"] + ([] if engine else ["prepare_model_for_inference"]), builds
+    # one reference contract read, which checks the windows; PyTorch then builds and prepares its
+    # model once, the engine path never
+    torch_build = ["configure_model", "prepare_model_for_inference"]
+    assert builds == ["configure_model"] + ([] if engine else torch_build), builds
     for start in (0, 1, 2):
         infer(tmp_path / "single" / f"map_L{start}.tif", "--layer-start", str(start), "--layer-end", str(start + DEPTH))
 
@@ -833,7 +895,13 @@ def test_layer_starts_refuse_windows_past_the_input_before_any_work(tmp_path, mo
         loads.append("engine")
         return InkrsEngine(_fake_inkrs(None), _WindowHandle(), device_index=0)
 
+    def counting_make(config):
+        loads.append("make_model")
+        return real_make(config)
+
+    real_make = infer_module.make_model
     monkeypatch.setattr(infer_module, "configure_model", counting_configure)
+    monkeypatch.setattr(infer_module, "make_model", counting_make)
     out = tmp_path / "multi" / "map.tif"
     args = normalize_inference_paths(
         parse_args([str(surface), str(checkpoint), str(out), *COMMON, "--direction", "both", "--layer-starts", starts])

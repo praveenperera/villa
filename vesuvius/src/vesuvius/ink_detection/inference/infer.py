@@ -47,6 +47,7 @@ from vesuvius.ink_detection.inference.engines import (
     decline_request,
     inkrs_command_reasons,
     inkrs_tiling_reason,
+    inkrs_window_reason,
     read_span,
     select_engine,
     span_key,
@@ -1636,7 +1637,8 @@ def prefetch_engine_window(
     The read then overlaps the engine's load, and the engine's first request
     takes the span from ``cache``. It selects the level and layers as
     ``infer_single_zarr`` does for the first direction; anything it cannot
-    work out is left to that run, which reports it in order.
+    work out is left to that run, which reports it in order. A window inkrs
+    would decline, such as one of 4 GiB or more, is not read.
     """
 
     try:
@@ -1645,7 +1647,7 @@ def prefetch_engine_window(
         root = open_volume_root(args.input_zarr)
         resolution = "0" if hasattr(root, "shape") else str(args.resolution)
         volume = select_volume_level(root, resolution, source=str(args.input_zarr))
-        depth_first, depth, *_ = _volume_axes(volume)
+        depth_first, depth, height, width, *_ = _volume_axes(volume)
         layer_indices = select_layer_indices(
             depth,
             layer_start=first.layer_start,
@@ -1654,6 +1656,11 @@ def prefetch_engine_window(
             direction=resolve_run_directions(args.direction)[0],
         )
     except Exception:
+        return
+    # inkrs is the only engine; a window it will decline is not read ahead
+    if inkrs_window_reason(
+        volume, configured_model.input_depth, height, width, configured_model.patch_size
+    ) is not None:
         return
     key, low, high = span_key(args.input_zarr, resolution, depth_first, layer_indices)
     cache.prefetch(key, lambda: read_span(volume, depth_first, low, high))
@@ -2140,7 +2147,10 @@ def run(
     engine_requested = (
         engine_factory is not None or str(getattr(args, "engine", "torch")) != "torch"
     )
-    configured = configure_model(args, build_model=not engine_requested)
+    # --layer-starts windows are checked from the contract alone, so a bad one
+    # fails before any model is built; PyTorch builds it for the first input it runs
+    build_now = not engine_requested and getattr(args, "layer_starts", None) is None
+    configured = configure_model(args, build_model=build_now)
     check_layer_windows(args, configured.input_depth)
     device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
     window_cache = WindowCache()
