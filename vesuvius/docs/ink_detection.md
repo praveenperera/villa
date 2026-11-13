@@ -486,18 +486,21 @@ silently replaced with robust normalization.
 ### Optional inkrs engine
 
 `--engine inkrs` runs flat inference with [inkrs](https://github.com/praveenperera/inkrs),
-a native CUDA engine, for the models and options it supports. villa still
-selects the layers, schedules the tiles and writes the TIFF; inkrs normalizes,
-runs the model and blends on the GPU. The default engine is PyTorch, and villa
-does not import inkrs unless `--engine inkrs` is given.
+a native GPU engine (CUDA on NVIDIA GPUs, Metal on Apple silicon), for the
+models and options it supports. villa still selects the layers, schedules the
+tiles and writes the TIFF; inkrs normalizes, runs the model and blends on the
+GPU. The default engine is PyTorch, and villa does not import inkrs unless
+`--engine inkrs` is given.
 
-inkrs runs from a safetensors export of the checkpoint. The first run with a
-`.pth` exports it into inkrs's cache (`~/.cache/inkrs/weights/` unless
-`INKRS_CACHE_DIR` or `XDG_CACHE_HOME` is set), and later runs reuse it:
+inkrs is an optional dependency, installed by the `inkrs` extra. inkrs loads
+cuDNN 9 and cuBLAS 12; PyTorch's CUDA 13 build provides the cuDNN, and on
+Linux the extra adds cuBLAS 12 (`nvidia-cublas-cu12`). inkrs runs from a
+safetensors export of the checkpoint. The first run with a `.pth` exports it
+into inkrs's cache (`~/.cache/inkrs/weights/` unless `INKRS_CACHE_DIR` or
+`XDG_CACHE_HOME` is set), and later runs reuse it:
 
 ```bash
-pip install inkrs
-uv run --extra models python -m vesuvius.ink_detection.inference.infer \
+uv run --extra models --extra inkrs python -m vesuvius.ink_detection.inference.infer \
   segment.zarr hybrid_3d2d-seed42.pth out.tif \
   --overlap 0.5 --blend-mode hann --direction both --engine inkrs
 ```
@@ -506,13 +509,15 @@ inkrs supports a subset of flat inference. When a command or an input is
 outside it, villa logs the reason and runs that input with PyTorch; pass
 `--engine-fallback error` to stop instead. inkrs itself decides which
 models, GPUs and volumes it supports, and reports the rest as unsupported:
-in its current release, the 17 x 128 x 128 `robust_mad` model family, uint8
-volumes at least 128 px on each side, and a 17-layer window under 4 GiB.
-villa adds its own limits for the options inkrs never sees:
+in its current release, `hybrid_3d2d-seed42`'s `robust_mad` architecture on
+17 x 128 x 128 tiles, or 17 x 384 x 384 for Reader V3, uint8 volumes at least
+one tile on each side, and a 17-layer window under 4 GiB. villa adds its own
+limits for the options inkrs never sees:
 
-- one CUDA device
+- one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there)
 - fp16 autocast (PyTorch's CUDA default, so `--amp-dtype default` qualifies)
-- Hann blending (the default with overlap) and a stride from 1 to 128
+- Hann blending (the default with overlap) and a stride from 1 to the tile
+  size (128, or 384 for Reader V3)
 - at least 17 layers in the input
 - no `--mask-path`, `--roi`, `--tta-mirror` or `--ensemble-checkpoint`
 
@@ -523,7 +528,7 @@ Each map matches PyTorch's to within 4/255, with the same covered pixels.
 To check that on your own data and GPU, run both engines and compare them:
 
 ```bash
-uv run --extra models python -m vesuvius.ink_detection.inference.engine_parity \
+uv run --extra models --extra inkrs python -m vesuvius.ink_detection.inference.engine_parity \
   segment.zarr hybrid_3d2d-seed42.pth parity/ --candidate inkrs --layer-starts 21:30 \
   -- --overlap 0.5 --blend-mode hann --batch-size 4 --direction both --no-compile
 ```

@@ -118,8 +118,9 @@ def add_engine_arguments(parser: argparse.ArgumentParser) -> None:
         default="torch",
         help=(
             "Inference engine. 'torch' (default) is the PyTorch path. 'inkrs' "
-            "uses the optional inkrs package for supported models on supported "
-            "NVIDIA GPUs and writes the same maps to within 4/255."
+            "uses the optional inkrs package (the inkrs extra) for supported "
+            "models on supported NVIDIA GPUs or Apple silicon, and writes the "
+            "same maps to within 4/255."
         ),
     )
     parser.add_argument(
@@ -279,8 +280,8 @@ class InkrsEngine:
             module = importlib.import_module("inkrs")
         except ImportError as exc:
             raise EngineUnavailable(
-                f"the inkrs package is not installed ({exc}); install it with "
-                "`pip install inkrs`"
+                f"the inkrs package is not installed ({exc}); install villa's "
+                "inkrs extra (`uv sync --extra models --extra inkrs`)"
             ) from exc
 
         device_index = 0 if device.index is None else int(device.index)
