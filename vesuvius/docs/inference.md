@@ -35,6 +35,8 @@ vesuvius.predict \
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
 | `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
 | `--blend_in_memory OUTPUT_PATH` | Blend the patches in RAM and write the finalized output (what `blend_and_finalize` would write) to `OUTPUT_PATH`, with no per-patch logits on disk. Takes `--mode`, `--threshold`/`--threshold_value`, `--blend_sigma_scale`, `--blend_chunk_size` and `--blend_compression_level`. See [Blending in memory](#blending-in-memory).
+| `--engine` | `torch` (default) or `inkrs`, which runs `--blend_in_memory --mode binary` with nnU-Net models on a CUDA GPU natively. See [Optional inkrs engine](#optional-inkrs-engine).
+| `--engine_fallback` | `torch` (default) runs PyTorch and logs why when `--engine inkrs` cannot run a request; `error` stops instead.
 | `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
@@ -147,6 +149,65 @@ for i in 0 1 2 3; do
     --blend_run_id "$blend_run_id" --blend_wait_timeout 3600 &
 done; wait
 ```
+
+### Optional inkrs engine
+
+`--engine inkrs` runs an in-memory, binary run of an nnU-Net model with
+[inkrs](https://github.com/praveenperera/inkrs), a native CUDA engine, instead of
+PyTorch. inkrs runs the sliding window, mirroring TTA, the Gaussian blend and the
+finalisation on the GPU and writes the same `(1, Z, Y, X)` uint8 array to
+`--blend_in_memory`. villa still parses the arguments, resolves the threshold and
+finds the model (a local folder, `s3://` through the model cache, or `hf://`). The
+default engine is PyTorch, and villa does not import inkrs unless `--engine inkrs`
+is given.
+
+inkrs is not one of villa's dependencies. Install version 0.4.0 or later into
+villa's environment. inkrs loads cuDNN 9 and cuBLAS 12: villa's CUDA 13 PyTorch
+provides the cuDNN, and `nvidia-cublas-cu12` adds the cuBLAS:
+
+```bash
+uv pip install "inkrs>=0.4.0" "nvidia-cublas-cu12>=12.1,<13"
+vesuvius.predict --model_path /path/to/surface_m7_nnunet --input_dir /data/volume.zarr \
+    --output_dir /tmp/unused --bbox "12032:12544,5248:5760,4736:5248" \
+    --blend_in_memory /tmp/final.zarr --threshold --threshold_value 0.2 --engine inkrs
+```
+
+The first run exports the model folder's checkpoint into inkrs's cache
+(`~/.cache/inkrs/` unless `INKRS_CACHE_DIR` or `XDG_CACHE_HOME` is set) and times
+cuDNN's algorithms; later runs reuse both.
+
+When a request is outside what inkrs runs, villa logs the reason and runs it with
+PyTorch; pass `--engine_fallback error` to stop instead. villa checks its own
+options before importing inkrs. A request falls back when it has:
+
+- no `--blend_in_memory`, or `--mode multiclass`
+- `--num_parts` above 1, `--tta_type rotation` (without `--disable_tta`),
+  `--patch_size`, `--save_softmax`, `--no_skip_empty_patches` or `--max_patches`
+- an input other than a local Zarr v2 array or a Zarr v2 group with an array `0`:
+  a remote input (`s3://`, `http://` and the like, or `--input_anon`), a Zarr v3
+  store or a TIFF stack
+- a remote `--blend_in_memory` output
+- a `.pth` checkpoint or a `--model_type` other than `auto` or `nnunet`
+- a `--device` other than a CUDA GPU, or no `--device` on a machine where PyTorch
+  sees no CUDA GPU
+- a `--blend_sigma_scale` other than 8, a `--blend_compression_level` other than 1,
+  or a `--blend_chunk_size` that is not cubic
+
+It also falls back without the inkrs package, or with an inkrs older than 0.4.0,
+which has no nnU-Net engine. inkrs then checks the model, the volume and the GPU
+itself and reports anything it does not implement as unsupported, which falls back
+too: in its 0.4.0 release, a uint8 volume, an nnU-Net ResEnc-L model such
+as `surface_m7_nnunet`, and an NVIDIA GPU of compute capability 8.0 or newer. Other
+inkrs errors, such as missing CUDA libraries or running out of GPU memory, stop the
+command. `--batch_size`, `--num_workers`, `--writer_workers`, `--chunk_cache_mb`,
+`--zarr_compressor` and `--zarr_compression_level` only shape PyTorch's run and
+have no effect on inkrs.
+
+inkrs's output is close to PyTorch's but not byte-identical. On a 512³ zone of
+PHerc. 0826 with `surface_m7_nnunet` (562M voxels), its probabilities differed from
+villa compiled's by at most 3/255, on 6 voxels, and from villa eager's by at most
+1/255. At `--threshold_value 0.2` the masks' IoU was 0.99969 against villa compiled
+and 0.99981 against villa eager, with the same covered voxels.
 
 ## Stage 2 — `vesuvius.blend_logits`
 
