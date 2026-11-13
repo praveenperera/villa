@@ -539,8 +539,9 @@ uv run --extra models --extra inkrs python -m vesuvius.ink_detection.inference.e
   -- --overlap 0.5 --blend-mode hann --batch-size 4 --direction both --no-compile
 ```
 
-It runs `--layer-start S --layer-end S+17` for each `S` from 21 to 29, once with
-PyTorch and once with inkrs, and writes `parity/parity.json`. A map passes when
+It runs `--layer-start S --layer-end S+17` (17 being the checkpoint's input
+depth) for each `S` from 21 to 29, once with PyTorch and once with inkrs, and
+writes `parity/parity.json`. A map passes when
 its Pearson correlation with PyTorch's is at least 0.9994, the 99.9th
 percentile and the maximum of the absolute difference are at most 4/255, and
 its coverage equals the coverage rebuilt from villa's tile schedule. A map

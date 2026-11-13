@@ -74,8 +74,6 @@ def test_stub_engine_through_villa_plumbing_matches_pytorch_exactly(tmp_path):
             "torch-stub",
             "--layer-starts",
             "0,1",
-            "--layer-depth",
-            str(DEPTH),
             "--",
             *COMMON,
             "--direction",
@@ -118,7 +116,7 @@ def test_stand_in_keeps_villas_occupancy_skip_and_the_gate_catches_losing_it(
     def parity(out):
         status = engine_parity.main(
             [str(surface), str(checkpoint), str(out), "--candidate", "torch-stub",
-             "--layer-starts", "1", "--layer-depth", str(DEPTH), "--", *COMMON]
+             "--layer-starts", "1", "--", *COMMON]
         )
         return status, json.loads((out / "parity.json").read_text())["maps"][0]
 
@@ -834,7 +832,7 @@ def test_harness_frees_pytorch_gpu_cache_before_loading_the_candidate(tmp_path, 
 
     status = engine_parity.main(
         [str(surface), str(checkpoint), str(tmp_path / "out"), "--candidate", "torch-stub",
-         "--layer-starts", "0,1", "--layer-depth", str(DEPTH), "--", *COMMON]
+         "--layer-starts", "0,1", "--", *COMMON]
     )
 
     assert status == 0
@@ -850,15 +848,18 @@ def test_harness_releases_the_mps_cache_on_macos(monkeypatch):
     assert events == ["mps", "cuda"]
 
 
-@pytest.mark.parametrize(("starts", "error"), [("1000,1001", ValueError), ("0,0", SystemExit), ("-1", SystemExit)])
+@pytest.mark.parametrize(
+    ("starts", "error"), [("1000,1001", ValueError), ("3", ValueError), ("0,0", SystemExit), ("-1", SystemExit)]
+)
 def test_harness_refuses_windows_it_cannot_compare_before_running(tmp_path, starts, error):
-    # a start past the 5-layer input would clamp to the full depth and compare that under its own name
+    # a window past the 5-layer input would clamp to the full depth and compare that under its own name;
+    # start 3 fits only a shallower model than the checkpoint's 3 layers, so the depth is the checkpoint's
     surface, _ = _write_surface(tmp_path / "surface.zarr")
     checkpoint = _save_checkpoint(tmp_path / "model.pth")
     with pytest.raises(error):
         engine_parity.main(
             [str(surface), str(checkpoint), str(tmp_path / "out"), "--candidate", "torch-stub",
-             f"--layer-starts={starts}", "--layer-depth", str(DEPTH), "--", *COMMON]
+             f"--layer-starts={starts}", "--", *COMMON]
         )
     assert not (tmp_path / "out").exists()
 

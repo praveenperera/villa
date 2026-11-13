@@ -1228,8 +1228,9 @@ def configure_model(
 ) -> ConfiguredModel:
     """Rebuild flat model(s) and one shared preprocessing contract.
 
-    With ``build_model=False`` only the checkpoints' contracts are read and
-    checked, and the result's ``model`` is None.
+    With ``build_model=False`` the checkpoints are still loaded on the CPU and
+    their contracts checked, but no model is built or given the weights, and
+    the result's ``model`` is None.
     """
 
     checkpoints = resolve_checkpoint_paths(args)

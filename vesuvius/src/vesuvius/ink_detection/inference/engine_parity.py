@@ -365,9 +365,8 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     parser.add_argument(
         "--layer-starts",
         help="Window starts as START:STOP or a comma list; each runs "
-        "--layer-start S --layer-end S+DEPTH",
+        "--layer-start S --layer-end S+DEPTH, DEPTH being the checkpoint's input depth",
     )
-    parser.add_argument("--layer-depth", type=int, default=17)
     args = parser.parse_args(argv[:split])
     if args.layer_starts is not None:
         # the same rules as infer's --layer-starts: distinct starts, none negative
@@ -378,34 +377,37 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
     return args, argv[split + 1 :]
 
 
-def check_windows(args: argparse.Namespace, infer_argv: Sequence[str]) -> None:
-    """Refuse a window past the input's depth before either engine runs.
+def resolve_windows(
+    args: argparse.Namespace, infer_argv: Sequence[str]
+) -> list[tuple[str, list[str]]]:
+    """Each map's name and window arguments, checked before either engine runs.
 
-    A single run clamps such a window and falls back to the full depth, so its
-    map would be compared under a start it did not read.
+    Window S is ``--layer-start S --layer-end S+DEPTH``, DEPTH being the
+    checkpoint's input depth, so each map covers exactly the layers its start
+    names. A window past the input's depth is refused: a single run clamps it
+    and falls back to the full depth, so its map would be compared under a
+    start it did not read.
     """
 
     if args.layer_starts is None:
-        return
+        return [("full", [])]
     flat_args = infer.normalize_inference_paths(
         infer.parse_args([str(args.input_zarr), str(args.checkpoint), "windows.tif", *infer_argv])
     )
+    depth = infer.configure_model(flat_args, build_model=False).input_depth
     flat_args.layer_starts = args.layer_starts
-    infer.check_layer_windows(flat_args, args.layer_depth)
+    infer.check_layer_windows(flat_args, depth)
+    return [
+        (f"L{start}", ["--layer-start", str(start), "--layer-end", str(start + depth)])
+        for start in args.layer_starts
+    ]
 
 
 def run_parity(args: argparse.Namespace, infer_argv: Sequence[str]) -> dict[str, Any]:
     """Run both engines over every window and return the per-map report."""
 
-    check_windows(args, infer_argv)
     maps = []
-    for start in args.layer_starts or [None]:
-        name = "full" if start is None else f"L{start}"
-        window = (
-            []
-            if start is None
-            else ["--layer-start", str(start), "--layer-end", str(start + args.layer_depth)]
-        )
+    for name, window in resolve_windows(args, infer_argv):
         outputs = {}
         recorder = None
         for engine in ("torch", args.candidate):
