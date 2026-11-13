@@ -334,13 +334,20 @@ def compare_maps(
     return report
 
 
-def _parse_layer_starts(value: str | None) -> list[int | None]:
-    if value is None:
-        return [None]
-    if ":" in value:
-        start, stop = (int(part) for part in value.split(":"))
-        return list(range(start, stop))
-    return [int(part) for part in value.split(",")]
+def release_reference_memory(device: torch.device) -> None:
+    """Return PyTorch's cached device memory before the candidate engine loads.
+
+    The reference run's model and cached blocks must not take memory the
+    candidate needs: CUDA memory on NVIDIA, or on macOS the unified memory
+    that both PyTorch's MPS cache and inkrs's Metal buffers draw from.
+    """
+
+    gc.collect()
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    else:
+        # a no-op when CUDA was never initialized
+        torch.cuda.empty_cache()
 
 
 def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
@@ -361,14 +368,38 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[argparse.Namespace, l
         "--layer-start S --layer-end S+DEPTH",
     )
     parser.add_argument("--layer-depth", type=int, default=17)
-    return parser.parse_args(argv[:split]), argv[split + 1 :]
+    args = parser.parse_args(argv[:split])
+    if args.layer_starts is not None:
+        # the same rules as infer's --layer-starts: distinct starts, none negative
+        try:
+            args.layer_starts = infer.parse_layer_starts(args.layer_starts)
+        except ValueError as exc:
+            parser.error(str(exc))
+    return args, argv[split + 1 :]
+
+
+def check_windows(args: argparse.Namespace, infer_argv: Sequence[str]) -> None:
+    """Refuse a window past the input's depth before either engine runs.
+
+    A single run clamps such a window and falls back to the full depth, so its
+    map would be compared under a start it did not read.
+    """
+
+    if args.layer_starts is None:
+        return
+    flat_args = infer.normalize_inference_paths(
+        infer.parse_args([str(args.input_zarr), str(args.checkpoint), "windows.tif", *infer_argv])
+    )
+    flat_args.layer_starts = args.layer_starts
+    infer.check_layer_windows(flat_args, args.layer_depth)
 
 
 def run_parity(args: argparse.Namespace, infer_argv: Sequence[str]) -> dict[str, Any]:
     """Run both engines over every window and return the per-map report."""
 
+    check_windows(args, infer_argv)
     maps = []
-    for start in _parse_layer_starts(args.layer_starts):
+    for start in args.layer_starts or [None]:
         name = "full" if start is None else f"L{start}"
         window = (
             []
@@ -403,10 +434,7 @@ def run_parity(args: argparse.Namespace, infer_argv: Sequence[str]) -> dict[str,
 
                 def factory(parsed, configured, device, load=load):
                     nonlocal recorder
-                    # the reference run's model and PyTorch's cached blocks must
-                    # not take GPU memory the candidate needs
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                    release_reference_memory(device)
                     recorder = RecordingEngine(load(parsed, configured, device))
                     return recorder
 

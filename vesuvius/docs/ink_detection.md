@@ -547,7 +547,9 @@ its coverage equals the coverage rebuilt from villa's tile schedule. A map
 with no covered pixels fails, and so does a run in which PyTorch's output is
 flat in every map, since neither tests the model. The command exits nonzero
 if the run fails. Name the engine with `--candidate`; an `--engine` after
-`--` is refused, because it would replace the PyTorch reference too.
+`--` is refused, because it would replace the PyTorch reference too. Starts
+follow `--layer-starts`'s rules: they must be distinct and not negative, and
+every window must fit in the input's depth, checked before either engine runs.
 `--candidate torch-stub` runs the
 same inkrs code path against a PyTorch stand-in for inkrs, which needs no
 inkrs install and should match PyTorch exactly.

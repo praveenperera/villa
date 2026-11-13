@@ -841,6 +841,28 @@ def test_harness_frees_pytorch_gpu_cache_before_loading_the_candidate(tmp_path, 
     assert events == ["empty_cache", "load"] * 2
 
 
+def test_harness_releases_the_mps_cache_on_macos(monkeypatch):
+    events = []
+    monkeypatch.setattr(engine_parity.torch.cuda, "empty_cache", lambda: events.append("cuda"))
+    monkeypatch.setattr(engine_parity.torch.mps, "empty_cache", lambda: events.append("mps"))
+    engine_parity.release_reference_memory(torch.device("mps"))
+    engine_parity.release_reference_memory(torch.device("cuda", 0))
+    assert events == ["mps", "cuda"]
+
+
+@pytest.mark.parametrize(("starts", "error"), [("1000,1001", ValueError), ("0,0", SystemExit), ("-1", SystemExit)])
+def test_harness_refuses_windows_it_cannot_compare_before_running(tmp_path, starts, error):
+    # a start past the 5-layer input would clamp to the full depth and compare that under its own name
+    surface, _ = _write_surface(tmp_path / "surface.zarr")
+    checkpoint = _save_checkpoint(tmp_path / "model.pth")
+    with pytest.raises(error):
+        engine_parity.main(
+            [str(surface), str(checkpoint), str(tmp_path / "out"), "--candidate", "torch-stub",
+             f"--layer-starts={starts}", "--layer-depth", str(DEPTH), "--", *COMMON]
+        )
+    assert not (tmp_path / "out").exists()
+
+
 class _WindowHandle(_RecordingHandle):
     """A recording stand-in whose map depends on the window it is sent."""
 
