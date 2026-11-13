@@ -8,6 +8,7 @@ import shutil
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from itertools import product
 from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
@@ -219,6 +220,40 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
     return {'chunk_idx': chunk_idx, 'processed_voxels': np.prod(output_np.shape)}
 
 
+def chunks_with_input(input_path, access, input_chunks, output_chunks, spatial_shape):
+    """
+    Spatial indices of the output chunks that overlap at least one stored input chunk, from a
+    listing of the input's chunk keys; no chunk data is read.
+
+    Returns None when listing would not be names only: a v3 store may be sharded, where listing
+    checks every inner chunk in the shard (on S3, by downloading the shard), and an HTTP store
+    cannot be listed.
+
+    Args:
+        input_path: Path to the input zarr
+        access: The input reader's access, so the listing authenticates as the reads do
+        input_chunks: Spatial chunk size (Z, Y, X) of the input
+        output_chunks: Spatial chunk size (Z, Y, X) of the output
+        spatial_shape: Spatial dimensions of the volume (Z, Y, X)
+
+    Returns:
+        Set of (z, y, x) output chunk indices, or None
+    """
+    if '://' in input_path and not input_path.startswith('s3://'):
+        return None
+    if not ObjectStore(input_path, auth=access).exists('.zarray'):
+        return None
+
+    covered = set()
+    for index in ZarrWriter.open(input_path, auth=access).stored_chunks():
+        # the leading index is the channel chunk; every channel maps to the same spatial chunks
+        covered.update(product(*(
+            range(i * ic // oc, (min((i + 1) * ic, dim) - 1) // oc + 1)
+            for i, ic, oc, dim in zip(index[1:], input_chunks, output_chunks, spatial_shape)
+        )))
+    return covered
+
+
 def finalize_logits(
     input_path: str,
     output_path: str,
@@ -419,7 +454,23 @@ def finalize_logits(
         chunk_infos = all_chunk_infos
 
     total_chunks = len(chunk_infos)
-    print(f"Processing data in {total_chunks} chunks using {num_workers} worker processes...")
+
+    # blend_logits stores only the chunks that patches reached, and an unstored chunk reads as the
+    # fill value. A --bbox prediction keeps the whole volume's shape, so when apply_finalization
+    # skips the fill as empty (any fill but NaN), visit only chunks behind stored input instead of
+    # reading every position
+    fill = np.full((num_classes, 1, 1, 1), input_store.fill_value, dtype=input_store.dtype)
+    config = FinalizeConfig(mode=mode, threshold=threshold, is_multi_task=is_multi_task, target_info=target_info)
+    _, fill_is_empty = apply_finalization(fill, num_classes, config)
+    with_input = None
+    if fill_is_empty:
+        with_input = chunks_with_input(input_path, input_store.access, input_store.chunks[1:], output_chunks[1:],
+                                       spatial_shape)
+    if with_input is not None:
+        chunk_infos = [info for info in chunk_infos if info['indices'] in with_input]
+    empty_chunks = total_chunks - len(chunk_infos)
+    print(f"Processing data in {len(chunk_infos)} of {total_chunks} chunks (the rest have no stored input) "
+          f"using {num_workers} worker processes...")
     
     # main processing function with partial application of common arguments
     # This allows us to pass only the chunk_info to the worker function
@@ -438,7 +489,6 @@ def finalize_logits(
     )
     
     total_processed = 0
-    empty_chunks = 0
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
 
         future_to_chunk = {executor.submit(process_chunk_partial, chunk): chunk for chunk in chunk_infos}
@@ -446,7 +496,7 @@ def finalize_logits(
         from concurrent.futures import as_completed
         for future in tqdm(
             as_completed(future_to_chunk),
-            total=total_chunks,
+            total=len(chunk_infos),
             desc="Processing Chunks",
             **tqdm_kwargs,
         ):
