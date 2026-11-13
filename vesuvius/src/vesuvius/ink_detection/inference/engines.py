@@ -367,6 +367,7 @@ def inkrs_command_reasons(
     """Why ``--engine inkrs`` cannot run this command at all, from villa's own options.
 
     Empty when it may run; inkrs then judges the checkpoint, GPU and inputs.
+    ``InkrsEngine.load`` checks these before it imports inkrs.
     """
 
     reasons = []
@@ -384,7 +385,30 @@ def inkrs_command_reasons(
     amp_dtype = configured_model.amp_dtype or torch.get_autocast_dtype("cuda")
     if amp_dtype != torch.float16:
         reasons.append(f"it reproduces fp16 autocast only, got {amp_dtype}")
+    # an ROI, a mask and the tiling hold for every input, so a command inkrs
+    # would decline for them never loads it
+    if getattr(args, "roi", None) is not None:
+        reasons.append("it does not crop to --roi")
+    if getattr(args, "mask_path", None) is not None:
+        reasons.append("it does not apply --mask-path")
+    tiling = _command_tiling(args, configured_model.patch_size)
+    if tiling is not None:
+        stride, blend_mode = tiling
+        reason = inkrs_tiling_reason(blend_mode, stride, configured_model.patch_size)
+        if reason is not None:
+            reasons.append(reason)
     return reasons
+
+
+def _command_tiling(args: argparse.Namespace, patch_size: int) -> tuple[int, str] | None:
+    # infer imports this module, so its tiling rule is imported when called
+    from vesuvius.ink_detection.inference.infer import resolve_tiling
+
+    try:
+        return resolve_tiling(args, patch_size)
+    except ValueError:
+        # the run reports a bad stride or overlap itself, before any input
+        return None
 
 
 def _inkrs_open(module: Any, checkpoint: Path, device_index: int) -> Any:

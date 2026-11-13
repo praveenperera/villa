@@ -46,7 +46,6 @@ from vesuvius.ink_detection.inference.engines import (
     add_engine_arguments,
     decline_request,
     inkrs_command_reasons,
-    inkrs_tiling_reason,
     inkrs_window_reason,
     read_span,
     select_engine,
@@ -1610,22 +1609,20 @@ def engine_window_wanted(
     """Whether to read a single input's window ahead for the engine.
 
     Not for folder runs, nor for inputs every engine declines (an ROI or a
-    mask), nor when ``--engine inkrs`` will refuse the command or its tiling.
+    mask), nor when ``--engine inkrs`` will refuse the command.
     """
 
     if args.folder is not None or getattr(args, "roi", None) is not None:
         return False
     if getattr(args, "mask_path", None) is not None:
         return False
+    try:
+        resolve_tiling(args, configured_model.patch_size)
+    except ValueError:
+        # the run reports a bad stride or overlap before reading anything
+        return False
     if engine_factory is None and str(getattr(args, "engine", "torch")) == "inkrs":
-        if not _inkrs_importable() or inkrs_command_reasons(args, configured_model, device):
-            return False
-        try:
-            stride, blend_mode = resolve_tiling(args, configured_model.patch_size)
-        except ValueError:
-            # the run itself reports a bad stride or overlap, before any engine
-            return False
-        return inkrs_tiling_reason(blend_mode, stride, configured_model.patch_size) is None
+        return _inkrs_importable() and not inkrs_command_reasons(args, configured_model, device)
     return True
 
 

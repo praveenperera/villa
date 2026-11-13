@@ -254,6 +254,26 @@ def test_inkrs_refuses_unsupported_models_and_options_before_importing(tmp_path,
     assert "not installed" not in message
 
 
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        (("--roi", "0", "8", "0", "8"), "it does not crop to --roi"),
+        (("--mask-path", "mask.png"), "it does not apply --mask-path"),
+        (("--blend-mode", "gaussian"), "it blends with Hann only, got 'gaussian'"),
+    ],
+)
+def test_inkrs_declines_roi_mask_and_blending_without_loading(tmp_path, monkeypatch, caplog, extra, reason):
+    # these hold for every input, so loading inkrs for them would only take GPU memory PyTorch needs
+    def never_load(checkpoint, *, device):
+        raise AssertionError("inkrs loaded for a command it declines")
+
+    monkeypatch.setitem(sys.modules, "inkrs", _fake_inkrs(never_load))
+    with caplog.at_level("WARNING"):
+        engine = select_engine(_engine_args(tmp_path, *extra), _inkrs_shaped_model(), torch.device("cuda", 0))
+    assert engine is None
+    assert reason in caplog.text
+
+
 def test_cpu_run_requesting_inkrs_writes_the_pytorch_map(tmp_path, monkeypatch, caplog):
     from vesuvius.ink_detection.inference import infer
 
