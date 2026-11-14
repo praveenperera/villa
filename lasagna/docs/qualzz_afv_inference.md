@@ -78,6 +78,33 @@ The generator may use a separate environment: its compressed backend requires
 Zarr 2.x, whereas Lasagna supports Zarr 3.x writing v2 stores. Extraction defaults
 to CPU; GPU extraction must separately reserve resources through the manager.
 
+### Optional: a faster drop-in tracer
+
+[`inkrs-afv-trace`](https://github.com/praveenperera/inkrs/tree/master/afv-trace) is a native port of
+`avf-spline-generator` 0.2.0. It takes the same arguments and writes the same
+`.afv`: on a 512-plane PHerc0826 band (2 × 512 × 8169 × 8169 predictions) every
+fibre, point block and index row matched the original's, and only the per-run
+uuid differed. With `--threads 4` on one host for both (a 24-core Intel Core Ultra 7
+270K Plus, with other work running) it traced that band in 191 s, against
+11,840 s (3.3 h) for the original, whose run was interrupted once and resumed
+(the time is the sum of both parts). Install it into the generator's environment
+and change only the command name:
+
+```bash
+pip install inkrs-afv-trace
+inkrs-afv-trace \
+  --predictions "$OUTPUT/predictions.zarr" --array semantic \
+  --tracing-predictions "$OUTPUT/predictions.zarr" --tracing-array tracing \
+  --voxel-size-um 9.6 --storage compressed --field-cache-mib 16384 \
+  --output "$OUTPUT/fibers.afv" --work-dir "$OUTPUT/tracing-work"
+```
+
+It runs on the CPU only (`--device cuda` is refused), and it needs more memory
+than the original: 12.4 GiB on that band, where the original peaked at 4.6 GiB
+in the resumed part of its run and 4.4 GiB in an earlier uninterrupted one. Its
+[README](https://github.com/praveenperera/inkrs/blob/master/afv-trace/README.md) covers the full comparison and a script
+that swaps it in for `avf-spline-generator` inside an existing environment.
+
 ## Validation
 
 CPU tests: `python -m pytest -q lasagna/tests/test_qualzz_inference.py`.
