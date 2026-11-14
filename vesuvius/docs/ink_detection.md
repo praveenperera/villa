@@ -460,7 +460,6 @@ the second output.
 | `--stride` | Explicit pixel stride; overrides `--overlap`. |
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
-| `--layer-starts` | Several windows in one run, as `START:STOP` (half-open) or a comma list such as `21,25,29`. Each start `S` runs exactly as `--layer-start S --layer-end S+DEPTH` would, where `DEPTH` is the model's input depth, and writes `<stem>_L<S><suffix>` (with `_reverse` after it for `--direction both`). The model, or the `--engine`, loads once for every window, which saves the per-process startup of a depth sweep. Single mode only; it replaces `--layer-start` and `--layer-end`. Starts must be distinct and not negative, and every window must fit in the input's depth: the run checks them all before the model loads and writes nothing if one does not fit. |
 | `--batch-size` | PyTorch batch size per selected device, default `1`. `--engine inkrs` keeps its own batch (64 tiles of 128 px, or 8 of 384 px). |
 | `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
@@ -516,10 +515,8 @@ outside it, villa logs the reason and runs that input with PyTorch; pass
 models, GPUs and volumes it supports, and reports the rest as unsupported:
 in its current release, `hybrid_3d2d-seed42`'s `robust_mad` architecture on
 17 x 128 x 128 tiles, or 17 x 384 x 384 for reader-v3, uint8 volumes at least
-one tile on each side, and a 17-layer window under 4 GiB. villa checks those
-volume limits from the input's metadata before it reads a window, so it never
-reads a whole window that inkrs will refuse. It adds its own limits for the
-options inkrs never sees:
+one tile on each side, and a 17-layer window under 4 GiB. villa adds its own
+limits for the options inkrs never sees:
 
 - one CUDA device, or the MPS device on macOS (inkrs needs macOS 26 there).
   On MPS, villa's PyTorch runs fp32 while inkrs runs fp16 on Metal; on an
@@ -541,11 +538,8 @@ load it, as it does without `--engine inkrs`. Other inkrs errors, such as
 missing CUDA libraries or running out of GPU memory, stop the command rather
 than fall back.
 
-When an input falls back, villa releases inkrs and its GPU memory before
-PyTorch builds its model, so the two never share the GPU, and runs every
-remaining input on PyTorch: later segments in folder mode, later
-`--layer-starts` windows and the other direction. It logs this once, as
-"Releasing inkrs for PyTorch fallback; remaining inputs run on PyTorch".
+When one input falls back, PyTorch builds its model for that input and the
+next input tries inkrs again.
 
 On the checkpoints tested, each inkrs map matched PyTorch's to within 4/255,
 with the same covered pixels. inkrs's

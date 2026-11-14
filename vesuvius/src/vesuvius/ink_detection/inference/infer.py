@@ -5,14 +5,11 @@ from __future__ import annotations
 from vesuvius.ink_detection.data.normalization import normalize_image
 
 import argparse
-import copy
 import functools
-import importlib.util
 import json
 import logging
 import math
 import shutil
-import sys
 import tempfile
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -38,19 +35,11 @@ from vesuvius.ink_detection.models.checkpoint import (
 )
 from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
 from vesuvius.ink_detection.inference.engines import (
-    EngineFactory,
-    EngineSlot,
     EngineUnavailable,
-    FlatEngine,
-    FlatEngineRequest,
-    WindowCache,
+    InkrsEngine,
     add_engine_arguments,
-    decline_request,
-    inkrs_command_reasons,
-    inkrs_window_reason,
-    read_span,
-    select_engine,
-    span_key,
+    fall_back,
+    load_engine,
 )
 from vesuvius.ink_detection.inference.inference_runtime import (
     DEVICE_CHOICES,
@@ -110,16 +99,11 @@ class ConfiguredModel:
     input_depth: int
     preprocessing: str
     amp_dtype: torch.dtype | None
-    # the checkpoint's own mixed_precision before --amp-dtype applies: the
-    # raw config value (None when absent) and the autocast dtype it names
-    stored_mixed_precision: Any = None
+    # the autocast dtype the checkpoint's own mixed_precision names, before --amp-dtype
     stored_amp_dtype: torch.dtype | None = None
-    # an optional alternative to the PyTorch forward and blend, with the
-    # source-layer reads its directions share; see engines.py
-    engine_slot: EngineSlot | None = None
-    # with an engine, PyTorch runs only the inputs the engine declines, so the
-    # model reaches the device on first use rather than sitting beside the
-    # engine's own copy in GPU memory
+    # with --engine inkrs, the engine, and the PyTorch model built on first use
+    # for an input the engine declines
+    engine: InkrsEngine | None = None
     prepare_model: Callable[[], nn.Module] | None = None
 
     def pytorch_model(self) -> nn.Module:
@@ -1325,7 +1309,6 @@ def configure_single_model(
         input_depth=crop_z,
         preprocessing=flat_preprocessing_from_config(config.data.normalization),
         amp_dtype=resolve_amp_dtype(amp_dtype, payload, checkpoint),
-        stored_mixed_precision=payload["config"].get("mixed_precision"),
         stored_amp_dtype=checkpoint_amp_dtype(payload, checkpoint),
     )
 
@@ -1452,42 +1435,25 @@ def infer_single_zarr(
     output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
     LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
     # with no tile scheduled the map is all zero, which the PyTorch path writes
-    # without reading the window or building a model, so the engine is kept
-    slot = configured_model.engine_slot if blocks else None
-    if slot is not None and slot.engine is not None and run_with_engine(
-        slot.engine,
-        FlatEngineRequest(
-            input_zarr=input_zarr,
-            resolution=resolution,
-            volume=volume,
-            depth_axis_first=depth_first,
-            height=height,
-            width=width,
-            layer_indices=layer_indices,
-            input_depth=configured_model.input_depth,
-            patch_size=patch_size,
-            stride=stride,
-            blend_mode=blend_mode,
-            preprocessing=configured_model.preprocessing,
-            blocks=tuple(blocks),
-            occupancy=occupancy,
-            window_cache=slot.window_cache,
-        ),
-        output_tiff=output_tiff,
-        tile_shape=tile_shape,
-        fallback=args.engine_fallback,
-        # the engine request carries no ROI or mask, so those runs stay on PyTorch
-        declined=(
-            "it does not crop to --roi" if roi_bounds is not None
-            else "it does not apply --mask-path" if mask is not None
-            else None
-        ),
-    ):
-        return
-    if slot is not None:
-        # PyTorch runs this input, so the engine goes before PyTorch builds its
-        # model on the same device; later inputs then run on PyTorch too
-        slot.release()
+    # without reading the window or building a model
+    engine = configured_model.engine if blocks else None
+    if engine is not None:
+        try:
+            # villa zero-pads a shallow input to the model depth; inkrs does not
+            if len(layer_indices) != configured_model.input_depth:
+                raise EngineUnavailable(
+                    f"it needs {configured_model.input_depth} source layers, got {len(layer_indices)}"
+                )
+            probability, _ = engine.run(
+                volume, depth_first, layer_indices, occupancy, stride, (str(input_zarr), resolution)
+            )
+        except EngineUnavailable as exc:
+            fall_back(f"The inkrs engine cannot run {input_zarr}: {exc}", fallback=args.engine_fallback)
+        else:
+            # an overwritten image must not inherit an earlier ROI run's metadata
+            output_tiff.with_suffix(output_tiff.suffix + ".roi.json").unlink(missing_ok=True)
+            write_uint8_tiff(probability, output_tiff, tile_shape)
+            return
     dataset = FlatBlockDataset(
         reader=reader,
         blocks=blocks,
@@ -1603,187 +1569,6 @@ def infer_single_zarr(
             }, indent=2) + "\n", encoding="utf-8")
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
-
-
-def _inkrs_importable() -> bool:
-    # sys.modules first: a module put there by hand has no spec, which find_spec rejects
-    if "inkrs" in sys.modules:
-        return sys.modules["inkrs"] is not None
-    try:
-        return importlib.util.find_spec("inkrs") is not None
-    except (ImportError, ValueError):
-        return False
-
-
-def engine_window_wanted(
-    args: argparse.Namespace,
-    configured_model: ConfiguredModel,
-    device: torch.device,
-    engine_factory: EngineFactory | None,
-) -> bool:
-    """Whether to read a single input's window ahead for the engine.
-
-    Not for folder runs, nor for inputs every engine declines (an ROI or a
-    mask), nor when ``--engine inkrs`` will refuse the command.
-    """
-
-    if args.folder is not None or getattr(args, "roi", None) is not None:
-        return False
-    if getattr(args, "mask_path", None) is not None:
-        return False
-    try:
-        resolve_tiling(args, configured_model.patch_size)
-    except ValueError:
-        # the run reports a bad stride or overlap before reading anything
-        return False
-    if engine_factory is None and str(getattr(args, "engine", "torch")) == "inkrs":
-        return _inkrs_importable() and not inkrs_command_reasons(args, configured_model, device)
-    return True
-
-
-def prefetch_engine_window(
-    args: argparse.Namespace, configured_model: ConfiguredModel, cache: WindowCache
-) -> None:
-    """Start reading a single input's source layers on a thread.
-
-    The read then overlaps the engine's load, and the engine's first request
-    takes the span from ``cache``. It selects the level and layers as
-    ``infer_single_zarr`` does for the first direction; anything it cannot
-    work out is left to that run, which reports it in order. A window inkrs
-    would decline, such as one of 4 GiB or more, is not read.
-    """
-
-    try:
-        # with --layer-starts, the first window's, which runs first
-        first, _ = resolve_layer_runs(args, configured_model.input_depth)[0]
-        root = open_volume_root(args.input_zarr)
-        resolution = "0" if hasattr(root, "shape") else str(args.resolution)
-        volume = select_volume_level(root, resolution, source=str(args.input_zarr))
-        depth_first, depth, height, width, *_ = _volume_axes(volume)
-        layer_indices = select_layer_indices(
-            depth,
-            layer_start=first.layer_start,
-            layer_end=first.layer_end,
-            output_depth=configured_model.input_depth,
-            direction=resolve_run_directions(args.direction)[0],
-        )
-    except Exception:
-        return
-    # inkrs is the only engine; a window it will decline is not read ahead
-    if len(layer_indices) != configured_model.input_depth:
-        return
-    if inkrs_window_reason(
-        volume, configured_model.input_depth, height, width, configured_model.patch_size
-    ) is not None:
-        return
-    key, low, high = span_key(args.input_zarr, resolution, depth_first, layer_indices)
-    cache.prefetch(key, lambda: read_span(volume, depth_first, low, high))
-
-
-def run_with_engine(
-    engine: FlatEngine,
-    request: FlatEngineRequest,
-    *,
-    output_tiff: Path,
-    tile_shape: tuple[int, int],
-    fallback: str,
-    declined: str | None = None,
-) -> bool:
-    """Write one map with an alternative engine; False leaves it to PyTorch."""
-
-    reason = declined or engine.unsupported_reason(request)
-    if reason is not None:
-        decline_request(engine, request, reason, fallback=fallback)
-        return False
-    try:
-        result = engine.predict(request)
-    except EngineUnavailable as exc:
-        decline_request(engine, request, str(exc), fallback=fallback)
-        return False
-    expected = (request.height, request.width)
-    if result.probability.shape != expected or result.coverage.shape != expected:
-        raise RuntimeError(
-            f"The {engine.name} engine returned maps of shape "
-            f"{result.probability.shape} and {result.coverage.shape}, expected {expected}"
-        )
-    # an overwritten image must not inherit an earlier ROI run's metadata
-    output_tiff.with_suffix(output_tiff.suffix + ".roi.json").unlink(missing_ok=True)
-    write_uint8_tiff(result.probability, output_tiff, tile_shape)
-    return True
-
-
-def parse_layer_starts(value: str) -> list[int]:
-    """Parse ``--layer-starts``: ``START:STOP`` (half-open) or a comma list.
-
-    The starts must be distinct, since each one names its own output, and
-    not negative: ``--layer-end`` is ``S+DEPTH``, which for a negative S can
-    cross zero and select a different window than S names.
-    """
-
-    if ":" in value:
-        start, stop = (int(part) for part in value.split(":"))
-        starts = list(range(start, stop))
-    else:
-        starts = [int(part) for part in value.split(",")]
-    if not starts:
-        raise ValueError(f"--layer-starts {value!r} selects no window")
-    if len(set(starts)) != len(starts):
-        raise ValueError(f"--layer-starts {value!r} repeats a start")
-    if min(starts) < 0:
-        raise ValueError(f"--layer-starts {value!r} has a negative start")
-    return starts
-
-
-def check_layer_windows(args: argparse.Namespace, input_depth: int) -> None:
-    """Refuse a ``--layer-starts`` window the input cannot hold, before any work.
-
-    A single ``--layer-start`` run falls back to the full depth when its
-    window is empty after clamping; one window of a multi-window run doing
-    that would write a map under a start it did not read, and a later bad
-    window would fail only after earlier maps were written. So every window
-    must lie inside the input's depth at the selected level, checked before
-    the model or engine loads.
-    """
-
-    starts = getattr(args, "layer_starts", None)
-    if starts is None:
-        return
-    root = open_volume_root(args.input_zarr)
-    resolution = "0" if hasattr(root, "shape") else str(args.resolution)
-    volume = select_volume_level(root, resolution, source=str(args.input_zarr))
-    _, depth, *_ = _volume_axes(volume)
-    outside = [s for s in starts if s + int(input_depth) > depth]
-    if outside:
-        raise ValueError(
-            f"--layer-starts: windows {outside} of {input_depth} layers end past "
-            f"the input's {depth} layers; the last start that fits is "
-            f"{depth - int(input_depth)}"
-        )
-
-
-def resolve_layer_runs(
-    args: argparse.Namespace, input_depth: int
-) -> list[tuple[argparse.Namespace, Path]]:
-    """The single-mode runs: one per ``--layer-starts`` window, else ``args``.
-
-    Window S runs exactly as ``--layer-start S --layer-end S+input_depth``
-    would, into ``<stem>_L<S><suffix>``, so one process can replace one
-    invocation per depth with the model or engine loaded once.
-    """
-
-    starts = getattr(args, "layer_starts", None)
-    if starts is None:
-        return [(args, args.output_tiff)]
-    runs = []
-    for start in starts:
-        window = copy.copy(args)
-        window.layer_start, window.layer_end = start, start + int(input_depth)
-        window.layer_starts = None
-        output = args.output_tiff
-        runs.append(
-            (window, output.with_name(f"{output.stem}_L{start}{output.suffix}"))
-        )
-    return runs
 
 
 def resolve_run_directions(direction: str) -> tuple[str, ...]:
@@ -2014,15 +1799,6 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--layer-start", type=int)
     parser.add_argument("--layer-end", type=int)
-    parser.add_argument(
-        "--layer-starts",
-        help=(
-            "Several source-Z windows in one run, as START:STOP (half-open) or "
-            "a comma list. Window S runs as --layer-start S --layer-end "
-            "S+DEPTH (the model's input depth) and writes <stem>_L<S><suffix>; "
-            "the model or engine loads once for all of them. Single mode only."
-        ),
-    )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
         "--direction", choices=("forward", "reverse", "both"), default="forward"
@@ -2058,15 +1834,6 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
-    if args.layer_starts is not None:
-        if args.layer_start is not None or args.layer_end is not None:
-            parser.error("--layer-starts replaces --layer-start and --layer-end")
-        if args.folder is not None:
-            parser.error("--layer-starts is for single mode, not --folder")
-        try:
-            args.layer_starts = parse_layer_starts(args.layer_starts)
-        except ValueError as exc:
-            parser.error(str(exc))
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -2077,27 +1844,24 @@ def parse_args(argv: Sequence[str] | None = None):
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the flat inference command."""
 
-    return run(normalize_inference_paths(parse_args(argv)))
-
-
-def run_inputs(
-    args: argparse.Namespace,
-    configured: ConfiguredModel,
-    device: torch.device,
-    engine_factory: EngineFactory | None,
-    window_cache: WindowCache,
-) -> None:
-    """Select the engine, then run every input and direction."""
-
-    # the closure holds the bare model, not `configured`, which will hold the
-    # closure and the engine; that cycle would keep the engine's GPU memory
-    # alive after run() returns, until the next full garbage collection
+    args = normalize_inference_paths(parse_args(argv))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(message)s",
+    )
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    # with --engine inkrs, PyTorch builds its model only for an input inkrs declines
+    configured = configure_model(args, build_model=args.engine == "torch")
+    device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
+    engine = None
+    if args.engine == "inkrs":
+        stride, blend_mode = resolve_tiling(args, configured.patch_size)
+        engine = load_engine(args, configured, device, stride, blend_mode)
     source_model = configured.model
 
-    def prepare() -> nn.Module:
-        model = source_model
-        if model is None:
-            model = configure_model(args).model
+    def prepare_model() -> nn.Module:
+        model = source_model if source_model is not None else configure_model(args).model
         model, _ = prepare_model_for_inference(
             model,
             gpu_ids=args.gpu_ids,
@@ -2108,79 +1872,26 @@ def run_inputs(
         )
         return model
 
-    engine = select_engine(args, configured, device, factory=engine_factory)
     if engine is None:
-        # PyTorch runs everything, so a span read ahead is not kept for the run
-        window_cache.close()
-        configured = replace(configured, model=prepare())
+        configured = replace(configured, model=prepare_model())
     else:
-        configured = replace(
-            configured,
-            engine_slot=EngineSlot(engine, window_cache),
-            prepare_model=functools.cache(prepare),
-        )
-        # the slot must be the engine's only owner, so a fallback can free it
-        del engine
+        configured = replace(configured, engine=engine, prepare_model=functools.cache(prepare_model))
     if args.folder is not None:
         infer_folder(args, configured, device=device)
-        return
-    # window by window, both directions of each together, so a direction
-    # pair still shares its source-layer read
-    for window, output in resolve_layer_runs(args, configured.input_depth):
+    else:
         for direction in resolve_run_directions(args.direction):
             infer_single_zarr(
-                args=window,
+                args=args,
                 input_zarr=args.input_zarr,
                 configured_model=configured,
                 device=device,
                 output_tiff=resolve_single_output_path(
-                    output,
+                    args.output_tiff,
                     direction=direction,
                     requested_direction=args.direction,
                 ),
                 layer_direction=direction,
             )
-
-
-def run(
-    args: argparse.Namespace, *, engine_factory: EngineFactory | None = None
-) -> int:
-    """Run parsed flat inference arguments.
-
-    ``engine_factory`` replaces the engine that ``--engine`` names, for tools
-    that compare engines.
-    """
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(levelname)s %(message)s",
-    )
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
-    # an engine runs without the PyTorch model, so with one requested the
-    # model is built only for the first input PyTorch runs, if any
-    engine_requested = (
-        engine_factory is not None or str(getattr(args, "engine", "torch")) != "torch"
-    )
-    # --layer-starts windows are checked from the contract alone, so a bad one
-    # fails before any model is built; PyTorch builds it for the first input it runs
-    build_now = not engine_requested and getattr(args, "layer_starts", None) is None
-    configured = configure_model(args, build_model=build_now)
-    check_layer_windows(args, configured.input_depth)
-    device = resolve_inference_device(gpu_ids=args.gpu_ids, device_type=args.device)
-    window_cache = WindowCache()
-    if engine_requested and engine_window_wanted(args, configured, device, engine_factory):
-        # the zarr read runs while the engine loads, which releases the GIL; it
-        # starts before inkrs has accepted the checkpoint and GPU, so when inkrs
-        # refuses at load (a key mismatch, an unsupported GPU), which is rare, the
-        # fallback waits for an unused read: time, not extra memory, since inkrs
-        # would hold the same window
-        prefetch_engine_window(args, configured, window_cache)
-    try:
-        run_inputs(args, configured, device, engine_factory, window_cache)
-    finally:
-        # a read ahead never outlives the run, whatever ended it
-        window_cache.close()
     return 0
 
 
