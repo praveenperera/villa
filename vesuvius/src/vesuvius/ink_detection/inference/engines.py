@@ -247,6 +247,12 @@ class WindowCache:
                 kept = None
             if kept is not None:
                 return kept
+        # drop the kept span before reading another, so a sweep or folder run
+        # never holds two windows at once
+        with self._lock:
+            if self._entry is entry:
+                self._entry = None
+        del entry
         span = _shared(read())
         future: Future = Future()
         future.set_result(span)
