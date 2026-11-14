@@ -88,3 +88,21 @@ def test_create_optimizer_accepts_parameter_groups():
         [id(model.bias)],
     ]
     assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
+
+
+def test_cudnn_benchmark_follows_config_on_cuda(monkeypatch):
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    trainer = _DummyTrainer()
+
+    trainer.device = torch.device("cpu")
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is False
+
+    trainer.device = torch.device("cuda")
+    trainer.mgr.cudnn_benchmark = False
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is False
+
+    del trainer.mgr.cudnn_benchmark
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is True

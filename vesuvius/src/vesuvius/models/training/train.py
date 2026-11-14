@@ -1517,6 +1517,16 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
+    def _configure_cudnn(self):
+        """Turns on cuDNN's benchmark mode for CUDA training unless tr_config.cudnn_benchmark is false"""
+        if self.device.type != 'cuda' or not getattr(self.mgr, 'cudnn_benchmark', True):
+            return
+        # every training batch has the same patch shape, so cuDNN's one-time search
+        # for the fastest convolution algorithm per shape is paid once and reused;
+        # precision is unchanged, but the chosen algorithm can round differently, and
+        # faster algorithms can need larger workspaces (more peak GPU memory)
+        torch.backends.cudnn.benchmark = True
+
     def _initialize_training(self):
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
@@ -1572,6 +1582,8 @@ class BaseTrainer:
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
+
+        self._configure_cudnn()
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:

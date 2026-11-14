@@ -192,6 +192,8 @@ class ConfigManager:
             )
         self.compile_policy = compile_policy
         self.startup_timing = bool(self.tr_configs.get("startup_timing", False))
+        # false keeps cuDNN's heuristic algorithm choice, for cards too close to their memory limit
+        self.cudnn_benchmark = bool(self.tr_configs.get("cudnn_benchmark", True))
         ddp_find_unused_parameters = self.tr_configs.get("ddp_find_unused_parameters", "auto")
         if isinstance(ddp_find_unused_parameters, str):
             ddp_find_unused_parameters_norm = ddp_find_unused_parameters.strip().lower()
