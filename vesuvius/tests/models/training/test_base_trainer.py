@@ -88,3 +88,28 @@ def test_create_optimizer_accepts_parameter_groups():
         [id(model.bias)],
     ]
     assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
+
+
+class _IndexDataset(torch.utils.data.Dataset):
+    def __len__(self):
+        return 8
+
+    def __getitem__(self, index):
+        return torch.tensor(index)
+
+
+def test_configure_dataloaders_keeps_training_workers_between_epochs():
+    trainer = _DummyTrainer()
+
+    for workers, persistent in ((0, False), (2, True)):
+        trainer.mgr.seed = 0
+        trainer.mgr.tr_val_split = 0.75
+        trainer.mgr.verbose = False
+        trainer.mgr.train_batch_size = 2
+        trainer.mgr.train_num_dataloader_workers = workers
+
+        train_loader, val_loader, train_indices, val_indices = trainer._configure_dataloaders(_IndexDataset())
+
+        assert train_loader.persistent_workers is persistent
+        assert val_loader.persistent_workers is False
+        assert sorted(train_indices + val_indices) == list(range(8))

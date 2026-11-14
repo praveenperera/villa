@@ -1501,6 +1501,10 @@ class BaseTrainer:
             shuffle=False,
             pin_memory=pin_mem,
             num_workers=self.mgr.train_num_dataloader_workers,
+            # keep the training workers alive between epochs instead of starting new
+            # ones (process start-up plus each worker's copy of the dataset) every epoch;
+            # validation keeps short-lived workers so they free their memory between runs
+            persistent_workers=bool(self.mgr.train_num_dataloader_workers),
             **dl_kwargs
         )
 
