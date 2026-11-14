@@ -1573,6 +1573,12 @@ class BaseTrainer:
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
 
+        if self.device.type == 'cuda':
+            # every training batch has the same patch shape, so cuDNN's one-time search
+            # for the fastest convolution algorithm per shape is paid once and reused;
+            # precision is unchanged, but the chosen algorithm can round differently
+            torch.backends.cudnn.benchmark = True
+
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
             print("Automatic Mixed Precision (AMP) is disabled")
