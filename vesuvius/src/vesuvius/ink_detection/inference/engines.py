@@ -198,8 +198,12 @@ class WindowCache:
         self._entry: tuple[SpanKey, Future] | None = None
         self._threads: list[threading.Thread] = []
 
-    def prefetch(self, key: SpanKey, read: Callable[[], np.ndarray]) -> None:
-        """Start ``read`` on a thread; a later ``span(key, ...)`` waits for it."""
+    def prefetch(self, key: SpanKey, read: Callable[[], np.ndarray | None]) -> None:
+        """Start ``read`` on a thread; a later ``span(key, ...)`` waits for it.
+
+        ``read`` may return None to read nothing, and a later ``span`` then
+        reads the span itself.
+        """
 
         future: Future = Future()
         with self._lock:
@@ -207,7 +211,8 @@ class WindowCache:
 
         def work() -> None:
             try:
-                future.set_result(_shared(read()))
+                span = read()
+                future.set_result(None if span is None else _shared(span))
             except BaseException as exc:
                 future.set_exception(exc)
 
@@ -236,10 +241,12 @@ class WindowCache:
             entry = self._entry
         if entry is not None and entry[0] == key:
             try:
-                return entry[1].result()
+                kept = entry[1].result()
             except Exception:
                 # a failed read ahead is read again here, so any error is this call's own
-                pass
+                kept = None
+            if kept is not None:
+                return kept
         span = _shared(read())
         future: Future = Future()
         future.set_result(span)

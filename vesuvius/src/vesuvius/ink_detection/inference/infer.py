@@ -1677,7 +1677,21 @@ def prefetch_engine_window(
     ) is not None:
         return
     key, low, high = span_key(args.input_zarr, resolution, depth_first, layer_indices)
-    cache.prefetch(key, lambda: read_span(volume, depth_first, low, high))
+    patch_size = configured_model.patch_size
+
+    def read() -> np.ndarray | None:
+        # an input whose occupancy scan schedules no tile never reaches the
+        # engine, so its window is not read; the scan reads only the small
+        # pyramid level, and on this thread it still overlaps the engine's load
+        stride, _ = resolve_tiling(args, patch_size)
+        occupancy, scale, _ = build_lowres_block_mask(
+            root, height=height, width=width, user_mask=None
+        )
+        if not iter_blocks((height, width), patch_size, stride, occupancy, scale):
+            return None
+        return read_span(volume, depth_first, low, high)
+
+    cache.prefetch(key, read)
 
 
 def run_with_engine(

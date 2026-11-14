@@ -725,9 +725,20 @@ def test_a_fallback_frees_the_engine_before_pytorch_builds_and_later_inputs_stay
         np.testing.assert_array_equal(tifffile.imread(forward), tifffile.imread(tmp_path / f"torch_{segment}.tif"))
 
 
-def test_an_input_with_no_scheduled_tile_is_written_without_the_engine_or_a_fallback(tmp_path, caplog):
+def test_an_input_with_no_scheduled_tile_is_written_without_the_engine_or_a_fallback(tmp_path, monkeypatch, caplog):
     # an empty level-3 mask schedules nothing; PyTorch writes the zero map without reading the window, so the
     # engine must not read and run it either, nor be released as if the input had fallen back
+    from vesuvius.ink_detection.inference import infer
+
+    reads = []
+    real_read = engines.read_span
+
+    def recording_read(*a):
+        reads.append(a[2:])
+        return real_read(*a)
+
+    monkeypatch.setattr(engines, "read_span", recording_read)
+    monkeypatch.setattr(infer, "read_span", recording_read)
     _, volume = _write_surface(tmp_path / "bare.zarr")
     empty = _write_group(tmp_path / "empty.zarr", volume, np.zeros((5, 6), dtype=np.uint8))
     level3 = np.zeros((5, 6), dtype=np.uint8)
@@ -744,11 +755,13 @@ def test_an_input_with_no_scheduled_tile_is_written_without_the_engine_or_a_fall
     with caplog.at_level("INFO"):
         run_on(empty, "empty.tif")
     assert handle.calls == []
+    # not even the read ahead read the window
+    assert reads == []
     assert not tifffile.imread(tmp_path / "empty.tif").any()
     assert "Releasing" not in caplog.text
-    # the engine still runs the next input that has tiles
+    # the engine still runs the next input that has tiles, from the window read ahead
     run_on(full, "full.tif")
-    assert len(handle.calls) == 1
+    assert len(handle.calls) == 1 and reads == [(1, 4)]
 
 
 def test_window_cache_keeps_one_span_and_never_a_failed_read():
