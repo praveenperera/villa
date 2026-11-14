@@ -26,6 +26,7 @@ import numpy as np
 
 from .store import Fiber, write_store
 from .cleanup import TOLERANCE, ExteriorBlack, clean
+from . import engines
 
 
 DEFAULT_MODEL = "Qualzz20/afv_fiber_9um"
@@ -281,6 +282,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--preview-dir", type=Path, help="Folder receiving a .vcobj of the fibers stitched so far after each block")
     parser.add_argument("--device", default="auto", help="auto (default), cuda, cuda:N, mps or cpu")
+    parser.add_argument(
+        "--engine",
+        choices=engines.ENGINES,
+        # argparse leaves defaults unchecked; generate() checks one from the environment
+        default=engines.default_engine(),
+        help=f"torch: PyTorch and this package's polylines; inkrs: the inkrs package, native and faster, same fibers (default: ${engines.ENGINE_VARIABLE}, else torch)",
+    )
+    parser.add_argument(
+        "--engine-fallback",
+        choices=engines.FALLBACKS,
+        default="torch",
+        help="When inkrs cannot run a step: torch runs it with PyTorch and warns, error fails (default: torch)",
+    )
     parser.add_argument("--progress", choices=("text", "json"), default="text", help="Progress as text on stderr, or JSON lines on stdout")
     return parser
 
@@ -288,8 +302,7 @@ def build_parser() -> argparse.ArgumentParser:
 def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     import torch
 
-    from .predict import predict_fibers
-    from .splines import extract_splines, threshold_to_u8
+    from .splines import threshold_to_u8
 
     output = args.output.expanduser().absolute()
     if output.suffix.lower() != ".vcobj":
@@ -307,6 +320,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         raise ValueError("--max-join-angle must be between 0 and 180")
     if args.min_length < 0 or args.black_distance < 0:
         raise ValueError("--min-length and --black-distance cannot be negative")
+    engines.check_engine(args.engine)
     if args.model == DEFAULT_MODEL and args.voxel_size:
         effective = args.voxel_size * args.native_scale
         if not 8.0 <= effective <= 10.0:
@@ -329,7 +343,15 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
     if device.type == "cpu":
         report.emit("warning", message="No GPU found: predicting on the CPU is very slow.")
     folder, provenance = resolve_model(args.model)
-    network, patch = load_network(folder, device)
+    engine = engines.open_engine(
+        args.engine,
+        args.engine_fallback,
+        folder,
+        device,
+        volume.dtype,
+        lambda: load_network(folder, device),
+        lambda message: report.emit("warning", message=message),
+    )
     mirror = args.mirror
 
     from .extend.stitch import Stitcher
@@ -353,6 +375,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
         "min_length_voxels": args.min_length,
         "black_distance_voxels": args.black_distance,
         "point_tolerance_voxels": TOLERANCE,
+        "engine": engine.used,
     }
     if args.extend:
         from .extend.ct_support import CTSupport
@@ -388,11 +411,8 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                 if black is not None:
                     black.add(ct, low)
                 report.emit("block", index=index, state="predicting")
-                probabilities = predict_fibers(
-                    network,
+                probabilities = engine.predict(
                     ct,
-                    patch,
-                    device=device,
                     mirror=mirror,
                     progress=lambda done, total: step(0.05 + 0.8 * done / total, f"predicting fibers · window {done} of {total}"),
                 )
@@ -403,7 +423,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                     part = (0 if family == "V" else 1) + (done / total if total else 1)
                     step(0.85 + 0.05 * part, f"fitting {names[family]} fibers · {done} of {total} pieces")
 
-                traces = extract_splines(probabilities, threshold, spline_progress)
+                traces = engine.splines(probabilities, threshold, spline_progress)
                 del probabilities
                 report.emit("block", index=index, state="stitching")
                 step(0.95, f"joining {len(traces)} fibers to the neighbouring blocks")
@@ -415,7 +435,7 @@ def generate(args: argparse.Namespace, report: Reporter) -> dict[str, Any]:
                     shown = clean(stitcher.stitched(), args.max_join_angle, args.min_length)
                     write(preview, shown)
                     report.emit("preview", path=str(preview), fibers=len(shown))
-            del network
+            engine.close()
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 

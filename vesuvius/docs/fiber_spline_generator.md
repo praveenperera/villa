@@ -45,6 +45,8 @@ whose file system supports hard links.
 | `--mirror` | off | test-time mirroring: better predictions, about 8× slower prediction |
 | `--threshold` | `60` | minimum fiber probability, in percent |
 | `--device` | `auto` | `cuda`, `cuda:N`, `mps` or `cpu`; `auto` prefers CUDA, then MPS |
+| `--engine` | `$VESUVIUS_FIBER_ENGINE`, else `torch` | `torch` or `inkrs`: what predicts the fibers and fits the polylines (see [Engine](#engine)) |
+| `--engine-fallback` | `torch` | when inkrs cannot run a step: `torch` runs it with PyTorch and warns, `error` fails |
 | `--block-size` | `512` | side of the cubes the zone is processed in, in voxels |
 | `--extend` | off | join fibers across gaps inside the zone with the gap model: longer fibers, several times slower |
 | `--max-join-angle` | `45` | inferred joins turning more than this many degrees are cut; `180` keeps them all |
@@ -107,6 +109,37 @@ whose file system supports hard links.
    each fiber's `inferred_gap_point_ranges` annotation. The `generator`
    metadata key records the model and its revision, the options, the volume,
    the zone, the blocks and, with `--extend`, the gap model.
+
+## Engine
+
+`--engine torch` runs the prediction and the polylines with this package's
+own code: PyTorch, then scikit-image and SciPy. `--engine inkrs` runs both
+steps natively with the inkrs package,
+installed into the same Python: the model on a CUDA GPU and the polylines on
+the CPU, on every platform. Both engines give the same fibers. Reading the
+volume, the blocks, stitching, extension, cleanup, the output and the
+progress events are the same with either engine; the `generator` metadata
+key records which engine ran each step.
+
+The default comes from the `VESUVIUS_FIBER_ENGINE` environment variable,
+else `torch`. VC3D passes its environment to the generator, so setting
+`VESUVIUS_FIBER_ENGINE=inkrs` before starting VC3D selects inkrs for its
+**Generate automated fibers…** runs, with inkrs installed into the Python
+VC3D runs the generator with.
+
+When inkrs cannot run a step, that step falls back to PyTorch with a
+warning, or the run fails under `--engine-fallback error`:
+
+- without the inkrs package, both steps run with PyTorch;
+- on a device other than a CUDA GPU (macOS, `--device mps` or `cpu`), or for
+  a volume that is not 8-bit, PyTorch predicts and inkrs still fits the
+  polylines;
+- when inkrs reports that it does not support the model or the GPU, PyTorch
+  predicts.
+
+Any other inkrs error, such as running out of GPU memory, fails the run.
+The first inkrs run of a model folder converts its checkpoint once, into
+inkrs' cache, which needs PyTorch.
 
 ## Model
 
