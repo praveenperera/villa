@@ -88,3 +88,26 @@ def test_create_optimizer_accepts_parameter_groups():
         [id(model.bias)],
     ]
     assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
+
+
+def test_task_losses_stay_on_device_until_read():
+    trainer = _DummyTrainer()
+    trainer.mgr.targets = {"ink": {"weight": 2.0}}
+    trainer.guide_loss_weight = 0.0
+
+    pred = torch.tensor([1.0, 2.0], requires_grad=True)
+    target = torch.tensor([0.0, 2.0])
+    loss_fns = {"ink": [(torch.nn.MSELoss(), 1.0)]}
+
+    total_loss, task_losses = trainer._compute_train_loss({"ink": pred}, {"ink": target}, loss_fns)
+
+    # the training step's value is a detached tensor that the loop reads after the optimizer step
+    assert torch.is_tensor(task_losses["ink"]) and not task_losses["ink"].requires_grad
+    assert float(task_losses["ink"]) == 1.0
+    assert total_loss.requires_grad and float(total_loss) == 1.0
+
+    raw = trainer._debug_raw_losses["ink/MSELoss"]["values"]
+    assert [float(v) for v in raw] == [0.5]
+
+    # validation reports plain floats, unweighted
+    assert trainer._compute_validation_loss({"ink": pred}, {"ink": target}, loss_fns) == {"ink": 0.5}

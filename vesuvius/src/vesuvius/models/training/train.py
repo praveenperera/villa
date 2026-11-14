@@ -1931,20 +1931,22 @@ class BaseTrainer:
                     self._debug_raw_losses = {}
                 if key not in self._debug_raw_losses:
                     self._debug_raw_losses[key] = {'values': [], 'weight': loss_weight}
-                self._debug_raw_losses[key]['values'].append(loss_value.item())
+                # kept on the device: a host read here would wait for the forward pass
+                # before backward could be queued; the epoch summary reads them once
+                self._debug_raw_losses[key]['values'].append(loss_value.detach())
 
                 task_total_loss += loss_weight * loss_value
 
             weighted_loss = task_weight * task_total_loss
             total_loss = total_loss + weighted_loss.to(total_loss.dtype)
-            task_losses[t_name] = weighted_loss.detach().cpu().item()
+            task_losses[t_name] = weighted_loss.detach()
 
         if self.guide_loss_weight > 0.0:
             guide_loss = self._compute_guide_alignment_loss(targets_dict)
             if guide_loss is not None:
                 weighted_guide_loss = self.guide_loss_weight * guide_loss
                 total_loss = total_loss + weighted_guide_loss.to(total_loss.dtype)
-                task_losses["guide_mask"] = weighted_guide_loss.detach().cpu().item()
+                task_losses["guide_mask"] = weighted_guide_loss.detach()
 
         return total_loss, task_losses
 
@@ -1963,7 +1965,7 @@ class BaseTrainer:
         _, task_losses = self._compute_task_losses(
             outputs, targets_dict, loss_fns, apply_task_weights=False
         )
-        return task_losses
+        return {t_name: float(loss_value) for t_name, loss_value in task_losses.items()}
 
     def _on_epoch_end(self, epoch, model, optimizer, scheduler, train_dataset,
                        ckpt_dir, model_ckpt_dir, checkpoint_history, best_checkpoints,
@@ -2168,10 +2170,12 @@ class BaseTrainer:
                     grad_accumulate_n=grad_accumulate_n
                 )
 
+                # the step's losses are read here, after backward and the optimizer step
+                # are queued, so this wait no longer sits between forward and backward
                 for t_name, loss_value in task_losses.items():
                     if t_name not in epoch_losses:
                         epoch_losses[t_name] = []
-                    epoch_losses[t_name].append(loss_value)
+                    epoch_losses[t_name].append(float(loss_value))
                 
 
                 if i == 0 and train_sample_input is None:
@@ -2278,7 +2282,7 @@ class BaseTrainer:
                 if hasattr(self, '_debug_raw_losses') and self._debug_raw_losses:
                     print("  [DEBUG] Raw loss averages:")
                     for key, data in self._debug_raw_losses.items():
-                        avg_raw = np.mean(data['values']) if data['values'] else 0
+                        avg_raw = np.mean([float(v) for v in data['values']]) if data['values'] else 0
                         print(f"    {key}: raw={avg_raw:.6f}, weight={data['weight']}, weighted={avg_raw * data['weight']:.6f}")
                     self._debug_raw_losses = {}  # Reset for next epoch
 
