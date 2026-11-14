@@ -15,7 +15,11 @@ from .test_cli import REQUIRED, bright_voxels_are_vertical_fibers, run, volume  
 
 
 class FakeInkrs(types.ModuleType):
-    """inkrs' fiber API on the CPU: the engine runs villa's own prediction with the test network, so its fibers are villa's"""
+    """inkrs' fiber API on the CPU: the engine runs villa's own prediction with the test network, so its fibers are villa's
+
+    Loading prints to stdout, as inkrs' export of a model folder does on its first run; ``run`` reads every stdout
+    line as a JSON event, so each test of the inkrs path also checks that the print stays off stdout
+    """
 
     class UnsupportedError(RuntimeError):
         pass
@@ -29,6 +33,7 @@ class FakeInkrs(types.ModuleType):
         class NnUNet:
             def __init__(self, model, device=0):
                 fake.opened.append((model, device))
+                print(f"wrote an export of {model}")
                 if refuse:
                     raise fake.UnsupportedError(refuse)
                 if fail:

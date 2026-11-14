@@ -4,8 +4,9 @@
 ``splines.extract_splines``. ``inkrs`` runs the same two steps natively with
 the inkrs package: the model on a CUDA GPU with ``inkrs.NnUNet.predict_block``,
 and the polylines on the CPU, on every platform, with ``inkrs.fiber_splines``.
-Both are drop-ins for this package's functions, with the same outputs. inkrs
-is imported only when it is asked for.
+Both are drop-ins for this package's functions: the polylines are the same,
+point for point, and the probabilities differ only as a different choice of
+cuDNN algorithm rounds them. inkrs is imported only when it is asked for.
 
 When inkrs cannot run a step, that step falls back to PyTorch with a
 warning, or the run fails with ``EngineUnavailable`` under
@@ -19,7 +20,9 @@ GPU memory, fails the run.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -121,7 +124,10 @@ def open_engine(
     network = None
     if reason is None:
         try:
-            network = inkrs.NnUNet(folder, device.index if device.index is not None else _current_cuda_device())
+            # the first run of a model folder exports it, and the exporter prints to stdout, which carries the
+            # JSON progress events
+            with contextlib.redirect_stdout(sys.stderr):
+                network = inkrs.NnUNet(folder, device.index if device.index is not None else _current_cuda_device())
         except inkrs.UnsupportedError as error:
             reason = str(error)
     if network is None:

@@ -287,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=engines.ENGINES,
         # argparse leaves defaults unchecked; generate() checks one from the environment
         default=engines.default_engine(),
-        help=f"torch: PyTorch and this package's polylines; inkrs: the inkrs package, native and faster, same fibers (default: ${engines.ENGINE_VARIABLE}, else torch)",
+        help=f"torch: PyTorch and this package's polylines; inkrs: the inkrs package, native and faster (default: ${engines.ENGINE_VARIABLE}, else torch)",
     )
     parser.add_argument(
         "--engine-fallback",

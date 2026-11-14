@@ -116,10 +116,20 @@ whose file system supports hard links.
 own code: PyTorch, then scikit-image and SciPy. `--engine inkrs` runs both
 steps natively with the inkrs package,
 installed into the same Python: the model on a CUDA GPU and the polylines on
-the CPU, on every platform. Both engines give the same fibers. Reading the
-volume, the blocks, stitching, extension, cleanup, the output and the
-progress events are the same with either engine; the `generator` metadata
-key records which engine ran each step.
+the CPU, on every platform. Reading the volume, the blocks, stitching,
+extension, cleanup, the output and the progress events are the same with
+either engine; the `generator` metadata key records which engine ran each
+step.
+
+The polylines inkrs fits are the ones this package fits, point for point.
+The predictions are close but not bitwise equal: inkrs and PyTorch pick
+different cuDNN algorithms, which round the model's bf16 arithmetic
+differently. On a 512³ zone of PHerc0826, 1.1–1.4% of the voxels differ,
+99.9% of all voxels by at most 3 of 255 steps, and the fibers differ
+slightly: 986 against 980, with about 97% of their length within 1.5 voxels of
+the other engine's. PyTorch with its cuDNN autotuner on
+(`torch.backends.cudnn.benchmark = True`) differs from PyTorch with it off by
+about as much.
 
 The default comes from the `VESUVIUS_FIBER_ENGINE` environment variable,
 else `torch`. VC3D passes its environment to the generator, so setting
