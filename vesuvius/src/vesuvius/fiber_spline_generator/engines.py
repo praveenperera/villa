@@ -4,9 +4,11 @@
 ``splines.extract_splines``. ``inkrs`` runs the same two steps natively with
 the inkrs package: the model on a CUDA GPU with ``inkrs.NnUNet.predict_block``,
 and the polylines on the CPU, on every platform, with ``inkrs.fiber_splines``.
-Both are drop-ins for this package's functions: the polylines are the same,
-point for point, and the probabilities differ only as a different choice of
-cuDNN algorithm rounds them. inkrs is imported only when it is asked for.
+Both are drop-ins for this package's functions: the polylines are the ones
+this package fits on x86-64, point for point, on every platform (on Apple
+silicon SciPy's fused multiply-adds make this package's own differ slightly),
+and the probabilities differ only as a different choice of cuDNN algorithm
+rounds them. inkrs is imported only when it is asked for.
 
 When inkrs cannot run a step, that step falls back to PyTorch with a
 warning, or the run fails with ``EngineUnavailable`` under

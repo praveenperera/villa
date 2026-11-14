@@ -121,7 +121,11 @@ extension, cleanup, the output and the progress events are the same with
 either engine; the `generator` metadata key records which engine ran each
 step.
 
-The polylines inkrs fits are the ones this package fits, point for point.
+The polylines inkrs fits are the ones this package fits on x86-64, point
+for point, on every platform. On Apple silicon, SciPy's own wheels compute
+the spline fits with fused multiply-adds, so this package's polylines there
+differ slightly from its x86-64 ones, and from inkrs'.
+
 The predictions are close but not bitwise equal: inkrs and PyTorch pick
 different cuDNN algorithms, which round the model's bf16 arithmetic
 differently. On a 512³ zone of PHerc0826, 1.1–1.4% of the voxels differ,
