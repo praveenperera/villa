@@ -192,6 +192,11 @@ class ConfigManager:
             )
         self.compile_policy = compile_policy
         self.startup_timing = bool(self.tr_configs.get("startup_timing", False))
+        # opt-in speed switches, off by default because both raise peak GPU memory;
+        # cudnn_benchmark unset leaves torch.backends.cudnn.benchmark as the process has it
+        cudnn_benchmark = self.tr_configs.get("cudnn_benchmark")
+        self.cudnn_benchmark = None if cudnn_benchmark is None else bool(cudnn_benchmark)
+        self.channels_last_3d = bool(self.tr_configs.get("channels_last_3d", False))
         ddp_find_unused_parameters = self.tr_configs.get("ddp_find_unused_parameters", "auto")
         if isinstance(ddp_find_unused_parameters, str):
             ddp_find_unused_parameters_norm = ddp_find_unused_parameters.strip().lower()

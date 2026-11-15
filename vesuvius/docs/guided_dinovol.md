@@ -91,7 +91,7 @@ uv run --extra models python -m vesuvius.models.benchmarks.benchmark_guided_dino
   - `ddp_wrapper`: preserve the legacy `torch.compile(DDP(model))` path
   - `off`: eager mode
 - The guided backbone path is explicitly excluded from compiler capture because full-token guided `ps256` hit an Inductor `BackendCompilerFailed` crash during the first compiled train step.
-- Do not expose or rely on a public `channels_last_3d` toggle; the measured gain was negligible relative to plain compile.
+- Leave `tr_config.channels_last_3d` off for guided models; its measured gain here was negligible relative to plain compile.
 - Prefer capped TokenBook prototypes for large training patches; the example config uses `256` for `128^3`.
 - The trainer now logs the guide validation visualization twice when guidance is enabled:
   - embedded inside the composite `debug_image`

@@ -1517,6 +1517,34 @@ class BaseTrainer:
 
         return train_dataloader, val_dataloader, train_indices, val_indices
 
+    def _configure_cudnn(self):
+        """Sets cuDNN's benchmark mode for CUDA training when tr_config.cudnn_benchmark is given"""
+        benchmark = getattr(self.mgr, 'cudnn_benchmark', None)
+        if self.device.type != 'cuda' or benchmark is None:
+            return
+        # every training batch has the same patch shape, so cuDNN's one-time search
+        # for the fastest convolution algorithm per shape is paid once and reused;
+        # precision is unchanged, but the chosen algorithm can round differently, and
+        # faster algorithms can need larger workspaces (more peak GPU memory). The flag is
+        # process-wide, so false is assigned too, in case an earlier trainer turned it on
+        torch.backends.cudnn.benchmark = bool(benchmark)
+
+    def _configure_memory_format(self, model):
+        """Converts a 3D CUDA model to channels_last_3d when tr_config.channels_last_3d is set"""
+        if not getattr(self.mgr, 'channels_last_3d', False) or self.device.type != 'cuda':
+            return model
+        if len(self.mgr.train_patch_size) != 3:
+            print("tr_config.channels_last_3d applies to 3D models only; keeping the default memory format")
+            return model
+        if self._resolve_compile_policy(model) == 'off' or not has_triton():
+            # eager InstanceNorm copies channels-last activations back to contiguous, and
+            # without torch.compile to fuse those copies the step gets slower, not faster
+            print("Warning: tr_config.channels_last_3d without torch.compile usually slows training down")
+        # cuDNN's 3D convolutions then skip the layout transposes around each call. Inputs
+        # need no conversion: convolutions follow their weights' layout, and a
+        # single-channel volume already has channels-last strides
+        return model.to(memory_format=torch.channels_last_3d)
+
     def _initialize_training(self):
         if detect_s3_paths(self.mgr):
             print("\nDetected S3 paths in configuration")
@@ -1572,6 +1600,9 @@ class BaseTrainer:
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
+
+        self._configure_cudnn()
+        model = self._configure_memory_format(model)
 
         use_amp = not getattr(self.mgr, 'no_amp', False)
         if not use_amp:
