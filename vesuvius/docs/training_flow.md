@@ -469,6 +469,13 @@ These `tr_config` switches are off by default. Each buys speed with GPU memory o
 - `cudnn_benchmark` left unset keeps whatever `torch.backends.cudnn.benchmark` the process already has; `false` turns it off.
 - Both apply to trainers that build their model through `BaseTrainer._initialize_training`.
 
+`augment_on_device: true` is the switch for the other bottleneck, data loading. Loader workers then only read and normalize patches, and the training step runs the augmentation pipeline (MedialSurface included) on the GPU as one batch. Turn it on when the training step waits on the loader, for example with few CPU cores per GPU or heavier augmentation:
+
+- Speed: it only helps when the loader is the bottleneck. With the recipe above, villa's default 8 loader workers kept up on 8 CPU cores of a lightly loaded machine (the step waited on data for under 1% of its time), so it brought no gain there.
+- Cost: about 2% more GPU time per step (4–7 ms at 256³, batch 1) and 0.2 GiB more GPU memory, so it slows down runs whose loader already keeps up.
+- Results: for the same seed, a sample gets the same augmentation on the GPU as in a loader worker. Labels, masks and skeletons match exactly, and images to float32 rounding (`tests/models/test_augment_on_device.py`). On 16 of the recipe's real 256³ training patches, labels, padding masks and skeletons matched in all 16, and images differed by at most 1.7e-6. Seeds follow each sample's position in the batch rather than its dataset index, so a run with the same seed draws different augmentations than a loader-augmented one, from the same distribution.
+- It cannot be combined with auxiliary tasks (see below).
+
 ## 6. Key Features and Design Patterns
 
 ### 6.1 Multi-Task Learning
