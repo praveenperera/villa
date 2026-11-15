@@ -88,3 +88,66 @@ def test_create_optimizer_accepts_parameter_groups():
         [id(model.bias)],
     ]
     assert [group["lr"] for group in optimizer.param_groups] == [2.5e-4, 1e-3]
+
+
+def test_cudnn_benchmark_is_opt_in_on_cuda(monkeypatch):
+    trainer = _DummyTrainer()
+
+    # unset leaves the process's flag as it was, on and off
+    trainer.device = torch.device("cuda")
+    for before in (False, True):
+        monkeypatch.setattr(torch.backends.cudnn, "benchmark", before)
+        trainer._configure_cudnn()
+        assert torch.backends.cudnn.benchmark is before
+
+    monkeypatch.setattr(torch.backends.cudnn, "benchmark", False)
+    trainer.mgr.cudnn_benchmark = True
+    trainer.device = torch.device("cpu")
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is False
+
+    trainer.device = torch.device("cuda")
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is True
+
+    # the flag is process-wide: a later trainer configured off must clear it
+    trainer.mgr.cudnn_benchmark = False
+    trainer._configure_cudnn()
+    assert torch.backends.cudnn.benchmark is False
+
+
+def _conv3d_model():
+    return torch.nn.Sequential(torch.nn.Conv3d(2, 4, 3), torch.nn.InstanceNorm3d(4, affine=True))
+
+
+def test_channels_last_3d_is_opt_in_for_3d_cuda_training():
+    trainer = _DummyTrainer()
+    trainer.mgr.train_patch_size = (8, 8, 8)
+    trainer.compile_policy = "off"
+
+    def weight_is_channels_last(model):
+        return model[0].weight.is_contiguous(memory_format=torch.channels_last_3d)
+
+    trainer.device = torch.device("cuda")
+    assert not weight_is_channels_last(trainer._configure_memory_format(_conv3d_model()))
+
+    trainer.mgr.channels_last_3d = True
+    trainer.device = torch.device("cpu")
+    assert not weight_is_channels_last(trainer._configure_memory_format(_conv3d_model()))
+
+    trainer.device = torch.device("cuda")
+    model = _conv3d_model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    converted = trainer._configure_memory_format(model)
+    assert weight_is_channels_last(converted)
+    # the optimizer, built before the conversion, still updates the converted weights
+    assert optimizer.param_groups[0]["params"][0] is converted[0].weight
+    out = converted(torch.randn(1, 2, 6, 6, 6))
+    out.sum().backward()
+    optimizer.step()
+    assert out.shape == (1, 4, 4, 4, 4)
+
+    # 2D models keep their layout instead of failing on channels_last_3d
+    trainer.mgr.train_patch_size = (8, 8)
+    conv2d = torch.nn.Conv2d(2, 4, 3)
+    assert trainer._configure_memory_format(conv2d).weight.is_contiguous()

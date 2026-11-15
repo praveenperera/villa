@@ -453,6 +453,22 @@ This design allows mixing fully supervised targets with auxiliary/self-supervise
 - Maintains the latest configuration file per run
 - Model-specific directory: `checkpoints/model_name/`
 
+### 5.4 Training Speed Options
+
+These `tr_config` switches are off by default. Each buys speed with GPU memory or GPU time, so turn them on per run when your setup has that to spare. Figures are from one RTX 5090 (32 GB) training the `surface_recto_3dunet` recipe at 256³ with `torch.compile` on, at batch 1, because the recipe's default batch 2 at 256³ does not fit in 32 GB:
+
+| `tr_config` key | What it does | Step time | Peak GPU memory | Turn it on when |
+|---|---|---|---|---|
+| `cudnn_benchmark: true` | cuDNN times its convolution algorithms once per input shape and keeps the fastest | 5.6% shorter (400 → 377 ms) | +5.8 GiB allocated (24.2 → 29.9 GiB) | the run has GPU memory to spare |
+| `channels_last_3d: true` | stores 3D weights and activations channels-last, so cuDNN's convolutions skip their layout transposes | 5.4% shorter (400 → 378 ms) | −1.0 GiB allocated, −3.3 GiB reserved | the GPU is the bottleneck and the model is compiled |
+| both | | 11.2% shorter (400 → 355 ms) | +5.3 GiB allocated (24.2 → 29.5 GiB) | |
+
+- Both change which convolution kernels run, so losses stay close to the defaults' without matching them bit for bit. Over 240 steps of the recipe from the same seed, the per-step loss stayed within 0.011 of the defaults' (the loss averaged 0.18 in magnitude), and the second epoch's mean loss matched to within 0.0003.
+- Leave `channels_last_3d` off when `compile_policy` is `off` or triton is missing: eager InstanceNorm copies channels-last activations back to contiguous, and the step gets slower. The trainer prints a warning in that case.
+- If either switch makes a run that used to fit run out of GPU memory, turn it off again.
+- `cudnn_benchmark` left unset keeps whatever `torch.backends.cudnn.benchmark` the process already has; `false` turns it off.
+- Both apply to trainers that build their model through `BaseTrainer._initialize_training`.
+
 ## 6. Key Features and Design Patterns
 
 ### 6.1 Multi-Task Learning

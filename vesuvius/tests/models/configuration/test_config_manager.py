@@ -130,6 +130,21 @@ class TestTargetNameValidation:
         finally:
             Path(temp_path).unlink()
 
+    def test_gpu_speed_switches_are_off_unless_configured(self, tmp_path):
+        defaults_path = tmp_path / "defaults.yaml"
+        defaults_path.write_text(yaml.dump({"tr_config": {"batch_size": 1}}))
+        mgr = ConfigManager(verbose=False)
+        mgr.load_config(defaults_path)
+        assert mgr.cudnn_benchmark is None
+        assert mgr.channels_last_3d is False
+
+        enabled_path = tmp_path / "enabled.yaml"
+        enabled_path.write_text(yaml.dump({"tr_config": {"cudnn_benchmark": True, "channels_last_3d": True}}))
+        mgr = ConfigManager(verbose=False)
+        mgr.load_config(enabled_path)
+        assert mgr.cudnn_benchmark is True
+        assert mgr.channels_last_3d is True
+
     def test_invalid_compile_policy_raises_value_error(self):
         config = {
             "tr_config": {
