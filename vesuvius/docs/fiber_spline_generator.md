@@ -114,8 +114,8 @@ whose file system supports hard links.
 
 `--engine torch` runs the prediction and the polylines with this package's
 own code: PyTorch, then scikit-image and SciPy. `--engine inkrs` runs both
-steps natively with the inkrs package,
-installed into the same Python: the model on a CUDA GPU and the polylines on
+steps natively with the inkrs package, version 0.4.0 or later
+(`pip install "inkrs>=0.4.0"`), installed into the same Python: the model on a CUDA GPU and the polylines on
 the CPU, on every platform. Reading the volume, the blocks, stitching,
 extension, cleanup, the output and the progress events are the same with
 either engine; the `generator` metadata key records which engine ran each
@@ -144,7 +144,8 @@ VC3D runs the generator with.
 When inkrs cannot run a step, that step falls back to PyTorch with a
 warning, or the run fails under `--engine-fallback error`:
 
-- without the inkrs package, both steps run with PyTorch;
+- without the inkrs package, or with one older than 0.4.0, both steps run
+  with PyTorch;
 - on a device other than a CUDA GPU (macOS, `--device mps` or `cpu`), or for
   a volume that is not 8-bit, PyTorch predicts and inkrs still fits the
   polylines;

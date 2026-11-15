@@ -50,6 +50,14 @@ class FakeInkrs(types.ModuleType):
         return extract_splines(probabilities, threshold, progress)
 
 
+def old_inkrs():
+    """inkrs before 0.4.0, as an install for its ink models leaves it: it imports, with no fiber engine"""
+    module = types.ModuleType("inkrs")
+    module.__version__ = "0.3.0"
+    module.UnsupportedError = FakeInkrs.UnsupportedError
+    return module
+
+
 @pytest.fixture
 def no_env(monkeypatch):
     monkeypatch.delenv(engines.ENGINE_VARIABLE, raising=False)
@@ -174,6 +182,20 @@ def test_missing_inkrs_falls_back_to_torch(monkeypatch, capsys, volume, tmp_path
     assert content == torch_fibers and generator["engine"] == {"predict": "torch", "splines": "torch"}
 
 
+def test_inkrs_without_the_fiber_engine_falls_back_to_torch(monkeypatch, capsys, volume, tmp_path, torch_fibers):
+    install(monkeypatch, old_inkrs())
+    on_cuda(monkeypatch)
+    real = engines.torch_predict
+    monkeypatch.setattr(engines, "torch_predict", lambda load, dev: real(load, torch.device("cpu")))
+    output = tmp_path / "fibers.vcobj"
+    code, events, loads = run_counting(monkeypatch, capsys, volume, output, "--engine", "inkrs")
+    assert code == 0 and len(loads) == 1
+    message, = warnings(events)
+    assert message == "inkrs cannot run, so PyTorch does: inkrs 0.3.0 has no fiber engine, which needs inkrs 0.4.0 or later"
+    content, generator = fibers(output)
+    assert content == torch_fibers and generator["engine"] == {"predict": "torch", "splines": "torch"}
+
+
 @pytest.mark.parametrize(
     "fake, device, reason",
     [
@@ -204,6 +226,7 @@ def test_prediction_alone_falls_back_when_inkrs_cannot_predict(monkeypatch, caps
     "fake, cuda, reason",
     [
         (lambda: None, True, "inkrs cannot run: the inkrs package does not import"),
+        (old_inkrs, True, "inkrs cannot run: inkrs 0.3.0 has no fiber engine"),
         (lambda: FakeInkrs(), False, "inkrs cannot predict fibers: it predicts on CUDA GPUs only"),
         (lambda: FakeInkrs(refuse="no fiber-tool export"), True, "inkrs cannot predict fibers: no fiber-tool export"),
     ],

@@ -13,8 +13,9 @@ rounds them. inkrs is imported only when it is asked for.
 When inkrs cannot run a step, that step falls back to PyTorch with a
 warning, or the run fails with ``EngineUnavailable`` under
 ``--engine-fallback error``. A step falls back when the inkrs package is
-missing, when inkrs raises ``UnsupportedError`` while loading the model
-(a model, export or GPU it does not implement) and, for prediction only,
+missing or older than 0.4.0 (the first with these two steps), when inkrs
+raises ``UnsupportedError`` while loading the model (a model, export or GPU
+it does not implement) and, for prediction only,
 before inkrs is asked: when the device is not a CUDA GPU (macOS among them)
 or the volume is not uint8. Any other inkrs error, such as running out of
 GPU memory, fails the run.
@@ -115,6 +116,12 @@ def open_engine(
         import inkrs
     except ImportError as error:
         unavailable("run", f"the inkrs package does not import ({error})")
+        return open_engine("torch", fallback, folder, device, volume_dtype, load_network, warn)
+
+    # inkrs before 0.4.0, installed for its ink models, imports but has neither step
+    if not all(hasattr(inkrs, name) for name in ("NnUNet", "fiber_splines", "UnsupportedError")):
+        version = getattr(inkrs, "__version__", "of unknown version")
+        unavailable("run", f"inkrs {version} has no fiber engine, which needs inkrs 0.4.0 or later")
         return open_engine("torch", fallback, folder, device, volume_dtype, load_network, warn)
 
     # villa's own options, checked before inkrs is asked, so that no export or GPU work starts for them
