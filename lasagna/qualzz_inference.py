@@ -6,8 +6,10 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import math
 import os
 from pathlib import Path
+import shutil
 import time
 
 import numpy as np
@@ -18,9 +20,16 @@ from lasagna.compact_zarr import _chunk_index, _create_array, _writer, atomic_ch
 from lasagna.cooperative_inference import cooperative_signals
 from lasagna.input_level import InputLevel
 from lasagna.tiled_predict3d import (
-    OutputProductSpec, omezarr_compressor_config, resolve_inference_devices,
+    OutputProductSpec, _canonical_local_tile_positions, _cleanup_predict3d_temp_files,
+    _plan_circular_z_depth, omezarr_compressor_config, resolve_inference_devices,
     run_tiled_inference_3d,
 )
+
+# Default memory for one XY block's float32 accumulator rings. A block's rings
+# hold only the Z planes the engine keeps live, so the budget bounds them
+# whatever the array's size.
+DEFAULT_ACCUMULATOR_GIB = 4.0
+SHARED_MEMORY_DIR = Path("/dev/shm")
 
 
 def _sha256(path):
@@ -149,6 +158,56 @@ class ProbabilityZarrOutputAdapter:
         pass
 
 
+def _ring_bytes(nz, ny, nx, *, tile_size, overlap, border, chunk_size, channels, flush_workers):
+    """Bytes of one engine call's float32 product and weight rings, sized as the engine does."""
+    zp, yp, xp = (n + 2 * border for n in (nz, ny, nx))
+    positions = _canonical_local_tile_positions(
+        volume_size=nz, crop_start=0, crop_padded_size=zp, tile_size=tile_size,
+        stride=tile_size - overlap, border=border, scaledown_multiple=1)
+    depth = _plan_circular_z_depth(
+        z_positions=positions, tile_size=tile_size, scaledown=1, z_size=zp,
+        chunk_size=chunk_size, output_begin=border, output_end=border + nz,
+        retain_one_flush=flush_workers > 0)
+    bricks = math.prod(-(-n // chunk_size) for n in (depth, yp, xp))
+    return (channels + 1) * bricks * chunk_size ** 3 * 4
+
+
+def _block_for_budget(budget_bytes, shape, *, tile_size, overlap, border, chunk_size, channels,
+                      flush_workers):
+    """Largest square XY block side whose rings fit ``budget_bytes``.
+
+    Sides are multiples of the chunk size, which keeps every output chunk
+    inside one block, and preferably of the tile stride too: with overlap =
+    2 x border, tile cores then tile the array and block edges fall on core
+    edges, so only the last tile row of an axis, shifted to end at the
+    array's edge, can reach two blocks and run twice.
+    """
+    nz, ny, nx = shape
+    def ring(side):
+        return _ring_bytes(nz, min(ny, side), min(nx, side), tile_size=tile_size, overlap=overlap,
+                           border=border, chunk_size=chunk_size, channels=channels,
+                           flush_workers=flush_workers)
+    aligned = math.lcm(chunk_size, tile_size - overlap)
+    step = aligned if ring(aligned) <= budget_bytes else chunk_size
+    if ring(step) > budget_bytes:
+        raise ValueError(f"accumulator budget too small: one {step}-voxel block needs "
+                         f"{ring(step) / 2**30:.2f} GiB")
+    side = step
+    while side < max(ny, nx) and ring(side + step) <= budget_bytes:
+        side += step
+    return side
+
+
+def _tile_slot_bytes(device_count, *, tile_size, channels):
+    """Shared-memory tile buffers of the engine's multi-device path.
+
+    The engine keeps two slots per device (its ``slots_per_gpu`` default), each
+    holding a uint8 input tile and the float32 product and weight tiles.
+    """
+    tile = tile_size ** 3
+    return int(device_count) * 2 * (tile + (channels + 1) * tile * 4)
+
+
 def _first_symlinked_dir(root):
     """The first directory symlink under ``root``, or None.
 
@@ -162,16 +221,53 @@ def _first_symlinked_dir(root):
     return None
 
 
+def _block_has_work(writer, product, input_level, shape, block, chunk_size):
+    """Whether an output chunk in the block is incomplete and has stored CT.
+
+    The engine leaves chunks without stored CT absent and skips completed ones,
+    so a block with neither kind of chunk would start its workers for nothing.
+    """
+    nz, ny, nx = shape
+    y0, y1, x0, x1 = block
+    for z, y, x in itertools.product(range(0, nz, chunk_size), range(y0, y1, chunk_size),
+                                     range(x0, x1, chunk_size)):
+        if writer.product_chunk_complete(product, chunk_origin_zyx=(z, y, x)):
+            continue
+        footprint = (z, min(nz, z + chunk_size), y, min(ny, y + chunk_size), x, min(nx, x + chunk_size))
+        if input_level.region_has_chunks(footprint):
+            return True
+    return False
+
+
+def _scratch_dir(requested, output, needed_bytes):
+    """Shared memory when one block's rings fit there; else beside the output.
+
+    File-backed rings on a disk are written back as they are dirtied, which
+    costs more than the tiles themselves on large arrays. A tmpfs that fills
+    up faults the writer with SIGBUS, hence the free-space margin.
+    """
+    if requested is not None:
+        return Path(requested).resolve()
+    if SHARED_MEMORY_DIR.is_dir() and shutil.disk_usage(SHARED_MEMORY_DIR).free >= needed_bytes * 5 // 4:
+        return SHARED_MEMORY_DIR
+    return output.parent
+
+
 @cooperative_signals
 def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
                   tile_size=128, overlap=32, border=16, chunk_size=128,
-                  flush_workers=8, accumulator_workers=8):
+                  flush_workers=8, accumulator_workers=8, accumulator_gib=DEFAULT_ACCUMULATOR_GIB,
+                  block_size=None, scratch_dir=None):
     if not np.isfinite(voxel_size_um) or not 8.64 <= voxel_size_um <= 9.6:
         raise ValueError("AFV V2 expects input voxels between 8.64 and 9.6 micrometres")
     if tile_size < 128 or tile_size % 64 or not 0 <= 2*border <= overlap < tile_size:
         raise ValueError("tile size must be >=128 and divisible by64; require 0<=2*border<=overlap<tile")
     if flush_workers < 0 or accumulator_workers < 0:
         raise ValueError("worker counts must be nonnegative")
+    if block_size is not None and (block_size < 0 or block_size % chunk_size):
+        raise ValueError("block size must be 0 (one pass) or a positive multiple of the chunk size")
+    if block_size is None and not (np.isfinite(accumulator_gib) and accumulator_gib > 0):
+        raise ValueError("accumulator budget must be a positive number of GiB")
     model_dir, input_path = Path(model_dir).resolve(), Path(input_path).resolve()
     hashes = {name: _sha256(model_dir / name)
               for name in ("model.py", "plans.json", "checkpoint_final.pth")}
@@ -197,6 +293,23 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
         raise ValueError("CUDA inference requires GPU-manager handling (LASAGNA_COOPERATIVE=1)")
     model = adapter.load_model(device=devices[0]) if devices[0].type == "cpu" else None
     nz, ny, nx = shape
+    rings = dict(tile_size=tile_size, overlap=overlap, border=border, chunk_size=chunk_size,
+                 channels=product.raw_channel_count, flush_workers=flush_workers)
+    if block_size is None:
+        block_size = _block_for_budget(int(accumulator_gib * 2**30), shape, **rings)
+    # Each block is one engine pass over the full Z depth. The engine places
+    # tiles on the array's lattice and reads their halos from the array, so a
+    # voxel gets the same tiles, weights and add order as in one whole pass.
+    by, bx = block_size or ny, block_size or nx
+    blocks = [(y0, min(ny, y0 + by), x0, min(nx, x0 + bx))
+              for y0 in range(0, ny, by) for x0 in range(0, nx, bx)]
+    needed = _ring_bytes(nz, min(ny, by), min(nx, bx), **rings)
+    tile_slots = _tile_slot_bytes(len(devices), tile_size=tile_size, channels=product.raw_channel_count)
+    scratch = _scratch_dir(scratch_dir, output, needed + tile_slots)
+    scratch.mkdir(parents=True, exist_ok=True)
+    _cleanup_predict3d_temp_files(scratch)
+    print(f"[qualzz] {len(blocks)} block(s) of up to {min(ny, by)}x{min(nx, bx)}; "
+          f"float32 rings up to {needed / 2**30:.2f} GiB in {scratch}", flush=True)
     # Tiles without stored CT are skipped, so CT the listing cannot see would
     # silently leave its output absent
     linked = _first_symlinked_dir(input_path)
@@ -206,15 +319,19 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
     with InputLevel(input_path) as input_level:
         if not input_level.region_has_chunks((0, nz, 0, ny, 0, nx)):
             raise ValueError(f"input lists no stored chunks: {input_path}")
-        run_tiled_inference_3d(model, source, crop_slices=(0,nz,0,ny,0,nx), device=devices[0],
-            model_adapter=adapter, output_adapter=writer, products=(product,),
-            output_regions_zyx={product.name: (0,0,0,nz,ny,nx)},
-            full_output_shapes_zyx={product.name: shape},
-            output_scaledown_base=1, tile_size=tile_size, overlap=overlap, border=border,
-            tmp_dir=str(output.parent), temp_prefix=output.stem + "_", devices=devices,
-            progress=dict(t0=time.time(), finalized_base_z=0, finalized_base_z_total=nz),
-            flush_workers=flush_workers, accumulator_workers=accumulator_workers,
-            product_accumulator_dtype="float32", input_level=input_level)
+        for index, (y0, y1, x0, x1) in enumerate(blocks):
+            if not _block_has_work(writer, product, input_level, shape, (y0, y1, x0, x1), chunk_size):
+                continue
+            print(f"[qualzz] block {index + 1}/{len(blocks)} y=[{y0},{y1}) x=[{x0},{x1})", flush=True)
+            run_tiled_inference_3d(model, source, crop_slices=(0,nz,y0,y1,x0,x1), device=devices[0],
+                model_adapter=adapter, output_adapter=writer, products=(product,),
+                output_regions_zyx={product.name: (0,y0,x0,nz,y1,x1)},
+                full_output_shapes_zyx={product.name: shape},
+                output_scaledown_base=1, tile_size=tile_size, overlap=overlap, border=border,
+                tmp_dir=str(scratch), temp_prefix=output.stem + "_", devices=devices,
+                progress=dict(t0=time.time(), finalized_base_z=0, finalized_base_z_total=nz),
+                flush_workers=flush_workers, accumulator_workers=accumulator_workers,
+                product_accumulator_dtype="float32", input_level=input_level)
     return output
 
 
@@ -233,6 +350,15 @@ def main(argv=None):
     parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--flush-workers", type=int, default=8)
     parser.add_argument("--accumulator-workers", type=int, default=8)
+    parser.add_argument("--accumulator-gib", type=float, default=DEFAULT_ACCUMULATOR_GIB,
+                        help="Memory for one XY block's float32 accumulator rings; picks the largest "
+                             f"block that fits. Default {DEFAULT_ACCUMULATOR_GIB:g}")
+    parser.add_argument("--block-size", type=int, default=None,
+                        help="XY block side in voxels instead of --accumulator-gib, a multiple of "
+                             "--chunk-size; 0 runs one pass over the whole array")
+    parser.add_argument("--scratch-dir", default=None,
+                        help="Directory for the float32 accumulator rings. Default: /dev/shm when "
+                             "one block's rings fit there, else the output's parent")
     args = vars(parser.parse_args(argv))
     args["devices"] = resolve_inference_devices(device=args.pop("device"), devices=args["devices"])
     args["input_path"] = args.pop("input")

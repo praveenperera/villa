@@ -747,6 +747,22 @@ def blend_ramp(length: int, border: int, overlap: int) -> np.ndarray:
 	return ramp
 
 
+def _blend_weight_extent(ramp: np.ndarray, scaledown: int, native_output_stride: int) -> tuple[int, int]:
+	"""Tile-local ``[lo, hi)`` holding every nonzero blend weight at one output scale.
+
+	Unscaled weights are the ramp's outer product, so their support is exactly
+	the ramp's. Gaussian-downscaled weights spread past it by amounts that depend
+	on rounding, so those scales keep the whole tile.
+	"""
+	length = len(ramp) // max(1, int(scaledown))
+	if int(scaledown) != 1 or int(native_output_stride) != 1:
+		return 0, length
+	nonzero = np.flatnonzero(ramp > 0.0)
+	if not nonzero.size:
+		return 0, length
+	return int(nonzero[0]), int(nonzero[-1]) + 1
+
+
 def _build_tile_positions(size: int, tile: int, stride: int) -> list[int]:
 	size = int(size)
 	tile = int(tile)
@@ -3109,6 +3125,13 @@ def run_tiled_inference_3d(
 	)
 
 	r = blend_ramp(int(tile_size), pad, int(overlap))
+	# A tile whose nonzero weight misses every needed output chunk adds only
+	# zero-weight parts, which accumulation drops, so the need test uses this
+	# extent. Crops then skip halo tiles that only reach in with their border.
+	weight_extent = {
+		sd: _blend_weight_extent(r, sd, native_output_stride)
+		for sd in set(scales.values())
+	}
 	w_full = None
 	w_native = None
 	w_by_scale = None
@@ -3243,22 +3266,25 @@ def run_tiled_inference_3d(
 			max(0, tx + x0 - pad), min(volume_shape[2], tx + x0 - pad + tile_size),
 		)
 
+	def _tile_weighted_region(sd: int, g: dict[str, Any], tz: int, ty: int, tx: int) -> RegionZYX:
+		"""Output region, clipped to the group's, where the tile has nonzero weight."""
+		lo, hi = weight_extent[sd]
+		clips = [
+			_downscaled_tile_clip(value + lo * sd, sd, hi - lo, size)
+			for value, size in zip((tz, ty, tx), g["shape"])
+		]
+		oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
+		b = g["b"]
+		return (
+			max(oz0, oz0 + clips[0][0] - b), min(oz1, oz0 + clips[0][1] - b),
+			max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
+			max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
+		)
+
 	def _tile_may_need_output(tz: int, ty: int, tx: int) -> bool:
 		"""Check durable output resume state without consulting input cache state."""
 		for sd, g in groups.items():
-			Zo, Yo, Xo = g["shape"]
-			ts = tile_size // sd
-			clips = [
-				_downscaled_tile_clip(value, sd, ts, size)
-				for value, size in zip((tz, ty, tx), (Zo, Yo, Xo))
-			]
-			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
-			b = g["b"]
-			reg = (
-				max(oz0, oz0 + clips[0][0] - b), min(oz1, oz0 + clips[0][1] - b),
-				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
-				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
-			)
+			reg = _tile_weighted_region(sd, g, tz, ty, tx)
 			for origin in _iter_chunk_origins_for_region(*reg, g["oc"], g["full_shape"]):
 				if any(
 					not output_adapter.product_chunk_complete(product, chunk_origin_zyx=origin)
@@ -3277,16 +3303,7 @@ def run_tiled_inference_3d(
 		needed_names: set[str] = set()
 		outcome: dict[str, int] = {}
 		for sd, g in groups.items():
-			Zo, Yo, Xo = g["shape"]
-			ts = tile_size // sd
-			clips = [_downscaled_tile_clip(v, sd, ts, size) for v, size in zip((tz, ty, tx), (Zo, Yo, Xo))]
-			oz0, oy0, ox0, oz1, oy1, ox1 = g["region"]
-			b = g["b"]
-			reg = (
-				max(oz0, oz0 + clips[0][0] - b), min(oz1, oz0 + clips[0][1] - b),
-				max(oy0, oy0 + clips[1][0] - b), min(oy1, oy0 + clips[1][1] - b),
-				max(ox0, ox0 + clips[2][0] - b), min(ox1, ox0 + clips[2][1] - b),
-			)
+			reg = _tile_weighted_region(sd, g, tz, ty, tx)
 			for missing in _needed_chunks(sd, g, reg, outcome=outcome).values():
 				needed_names.update(product.name for product in missing)
 		if needed_names:

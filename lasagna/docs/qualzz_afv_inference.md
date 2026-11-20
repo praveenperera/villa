@@ -39,17 +39,35 @@ python -m lasagna.qualzz_inference \
 CUDA always uses the GPU manager. The usual `LASAGNA_GPU_MEMORY_GIB`,
 `LASAGNA_GPU_PRIORITY`, `VILLA_GPU_MANAGER_SOCKET` and `CUDA_VISIBLE_DEVICES`
 settings apply. Without a measured memory budget, workers request whole GPUs.
-CPU execution is available with `--device cpu` for tests. Tile accumulators live
-alongside the output store, not in `/tmp`. This is a foreground inference CLI,
-not a new `las_manager` catalog model type.
+CPU execution is available with `--device cpu` for tests. This is a foreground
+inference CLI, not a new `las_manager` catalog model type.
 
-## Empty regions
+## Memory and empty regions
+
+The array is predicted in XY blocks, each one engine pass over the full Z depth.
+Tiles sit on the whole array's lattice and read their halos from the array, so
+the output is the same as one pass over the whole array. A block's float32
+accumulator rings are bounded by `--accumulator-gib` (default 4), whatever the
+array's size: the command picks the largest square block whose rings fit. Block
+sides are multiples of the chunk size and, where the budget allows, of the tile
+stride, so tiles do not run twice, except perhaps the last tile row of an axis,
+which is shifted to end at the array's edge. With the default tiles and chunks,
+sides of 384, 768 and 1536 voxels need about 1.1, 3.5 and 11.9 GiB. Each block
+starts the engine again, so very small blocks cost start-up time. `--block-size`
+sets the side directly (`0` runs one pass).
+
+The rings live in `/dev/shm` when one block's rings and the engine's tile
+buffers fit there with a quarter to spare, else beside the output store; `--scratch-dir` chooses another directory.
+Shared memory counts as used RAM. Rings in a disk directory are written back as
+the page cache fills, which can cost more time than the tiles on a large array.
 
 Tiles whose input has no stored CT chunk are not run, and output chunks whose own
-CT chunks are all absent are left absent, so they read as zero. Stored chunks are
-found from one listing of the input store, which does not descend into symlinked
-directories, so the command refuses an input with a symlinked directory
-(symlinked chunk files are fine) and stops if the listing finds no chunk at all.
+CT chunks are all absent are left absent, so they read as zero. Blocks whose
+output chunks are all complete or without stored CT are skipped without starting
+the engine. Stored chunks are found from one listing of the input store, which
+does not descend into symlinked directories, so the command refuses an input with
+a symlinked directory (symlinked chunk files are fine) and stops if the listing
+finds no chunk at all.
 
 Repeat the same command to resume completed chunk pairs. Outputs written before
 chunks without CT were left absent record an older provenance version and are
@@ -93,7 +111,7 @@ to CPU; GPU extraction must separately reserve resources through the manager.
 CPU tests: `python -m pytest -q lasagna/tests/test_qualzz_inference.py`.
 They cover four-class softmax, upstream normalization dispatch, pooled-before-
 quantized output, odd edges, v2 layout, paired completion/provenance validation,
-serial/spawned-flush inference with exact expected output and resume, and
-empty-tile skipping against one dense pass: the same bytes wherever CT is
-stored and absent chunks elsewhere.
+serial/spawned-flush inference with exact expected output and resume, and XY
+blocks with empty-tile skipping against one dense pass: the same bytes wherever
+CT is stored, absent chunks elsewhere, and no tile run twice.
 These synthetic tests do not establish full-checkpoint throughput or GPU memory.

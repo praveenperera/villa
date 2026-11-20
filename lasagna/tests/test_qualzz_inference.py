@@ -7,9 +7,10 @@ import pytest
 import torch
 from vc_reader.reader import ZarrWriter, create_group, open_group, open_zarr
 
+from lasagna import qualzz_inference
 from lasagna.qualzz_inference import (
-    QualzzModelAdapter, ProbabilityZarrOutputAdapter, _NormalizedModel, _pool2,
-    _quantize, run_inference,
+    QualzzModelAdapter, ProbabilityZarrOutputAdapter, _NormalizedModel, _block_for_budget,
+    _pool2, _quantize, run_inference,
 )
 from lasagna.tiled_predict3d import run_tiled_inference_3d
 
@@ -192,17 +193,22 @@ def _context_model(tmp_path):
 
 
 def _sparse_ct(path, shape=(40, 480, 480), chunk=64):
-    """CT whose only stored chunks are y,x chunk indices 1-2; the rest read as 0."""
+    """CT whose only stored chunks are y,x chunk indices 1-4; the rest read as 0."""
     writer = ZarrWriter.create(path, shape=shape, chunks=(chunk,)*3, dtype=np.uint8,
                                compressor=None, separator="/")
     rng = np.random.default_rng(5)
-    writer[:, chunk:3*chunk, chunk:3*chunk] = rng.integers(1, 256, (shape[0], 2*chunk, 2*chunk), np.uint8)
+    writer[:, chunk:5*chunk, chunk:5*chunk] = rng.integers(1, 256, (shape[0], 4*chunk, 4*chunk), np.uint8)
     return open_zarr(path)
 
 
 @pytest.mark.parametrize("overlap", [32, 64])
-def test_empty_tiles_match_one_dense_pass(tmp_path, monkeypatch, overlap):
-    # overlap 64 blends tile cores, so voxels sum several tiles.
+def test_blocks_and_empty_tiles_match_one_dense_pass(tmp_path, monkeypatch, overlap):
+    # overlap 32 = 2 x border: tile cores tile space, so stride-aligned blocks
+    # must run no tile twice (480 keeps the last tile on the stride lattice).
+    # The 192 block edge lies inside the stored CT, where an engine that tested
+    # tile footprints would rerun the neighbouring block's border tiles.
+    # overlap 64 blends cores, so voxels sum several tiles and must keep their
+    # add order across block edges.
     folder = _context_model(tmp_path)
     source = _sparse_ct(tmp_path / "ct.zarr/0")
     shape, chunk = source.shape, 64
@@ -227,24 +233,42 @@ def test_empty_tiles_match_one_dense_pass(tmp_path, monkeypatch, overlap):
         tmp_dir=str(tmp_path), product_accumulator_dtype="float32")
     dense_tiles = sum(calls)
 
-    calls.clear()
-    path = run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0",
-                         output=tmp_path / "sparse.zarr", voxel_size_um=9.6,
-                         devices=(torch.device("cpu"),), overlap=overlap, chunk_size=chunk,
-                         flush_workers=0, accumulator_workers=0)
-    sparse, sparse_tiles = open_group(path), sum(calls)
+    runs = {}
+    for block_size in (0, 192):
+        calls.clear()
+        scratch = tmp_path / f"scratch{block_size}"
+        scratch.mkdir()
+        path = run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0",
+                             output=tmp_path / f"blocks{block_size}.zarr", voxel_size_um=9.6,
+                             devices=(torch.device("cpu"),), overlap=overlap, chunk_size=chunk,
+                             flush_workers=0, accumulator_workers=0, block_size=block_size,
+                             scratch_dir=scratch)
+        assert not any(scratch.iterdir()), "accumulator rings must be removed"
+        runs[block_size] = (open_group(path), sum(calls))
 
     reference = open_group(dense.root)
     stored = np.zeros(shape, bool)
-    stored[:, chunk:3*chunk, chunk:3*chunk] = True
+    stored[:, chunk:5*chunk, chunk:5*chunk] = True
     for name, factor in (("semantic", 1), ("tracing", 2)):
         expected = reference[name][:]
         has_ct = stored[::factor, ::factor, ::factor][tuple(slice(n) for n in expected.shape[1:])]
-        actual = sparse[name][:]
-        np.testing.assert_array_equal(actual[:, has_ct], expected[:, has_ct])
-        assert not actual[:, ~has_ct].any()
+        for group, _ in runs.values():
+            actual = group[name][:]
+            np.testing.assert_array_equal(actual[:, has_ct], expected[:, has_ct])
+            assert not actual[:, ~has_ct].any()
         assert expected[:, ~has_ct].any(), "dense pass must predict over absent CT"
-    assert sparse_tiles < dense_tiles
+        np.testing.assert_array_equal(runs[192][0][name][:], runs[0][0][name][:])
+    one_pass_tiles = runs[0][1]
+    assert one_pass_tiles < dense_tiles
+    if overlap == 32:
+        assert runs[192][1] == one_pass_tiles
+
+    def no_engine(*args, **kwargs):
+        raise AssertionError("resuming a finished output started the engine")
+    monkeypatch.setattr(qualzz_inference, "run_tiled_inference_3d", no_engine)
+    run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0", output=tmp_path / "blocks192.zarr",
+                  voxel_size_um=9.6, devices=(torch.device("cpu"),), overlap=overlap, chunk_size=chunk,
+                  flush_workers=0, accumulator_workers=0, block_size=192, scratch_dir=tmp_path / "scratch192")
 
 
 def test_input_without_stored_chunks_is_refused(tmp_path):
@@ -254,7 +278,7 @@ def test_input_without_stored_chunks_is_refused(tmp_path):
     with pytest.raises(ValueError, match="no stored chunks"):
         run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0", output=tmp_path / "out.zarr",
                       voxel_size_um=9.6, devices=(torch.device("cpu"),), chunk_size=4,
-                      flush_workers=0, accumulator_workers=0)
+                      flush_workers=0, accumulator_workers=0, scratch_dir=tmp_path)
 
 
 def test_input_with_symlinked_directory_is_refused(tmp_path):
@@ -270,4 +294,17 @@ def test_input_with_symlinked_directory_is_refused(tmp_path):
     with pytest.raises(ValueError, match="symlinked directory"):
         run_inference(model_dir=folder, input_path=level, output=tmp_path / "out.zarr",
                       voxel_size_um=9.6, devices=(torch.device("cpu"),), chunk_size=4,
-                      flush_workers=0, accumulator_workers=0)
+                      flush_workers=0, accumulator_workers=0, scratch_dir=tmp_path)
+
+
+def test_accumulator_budget_picks_stride_aligned_blocks():
+    # A PHerc1545 band at the default tiles and chunks: 384-voxel steps are
+    # both 3 chunks and 4 tile strides.
+    rings = dict(tile_size=128, overlap=32, border=16, chunk_size=128, channels=2, flush_workers=2)
+    band = (512, 7506, 7506)
+    assert [_block_for_budget(gib * 2**30, band, **rings) for gib in (1.2, 2, 4, 12)] == [384, 384, 768, 1536]
+    assert _block_for_budget(2**40, (512, 1000, 600), **rings) == 1152
+    # Below one aligned block it falls back to whole chunks, then refuses.
+    assert _block_for_budget(2**29, band, **rings) == 128
+    with pytest.raises(ValueError, match="budget too small"):
+        _block_for_budget(2**27, band, **rings)
