@@ -43,7 +43,17 @@ CPU execution is available with `--device cpu` for tests. Tile accumulators live
 alongside the output store, not in `/tmp`. This is a foreground inference CLI,
 not a new `las_manager` catalog model type.
 
-Repeat the same command to resume completed chunk pairs. Checkpoint, model code,
+## Empty regions
+
+Tiles whose input has no stored CT chunk are not run, and output chunks whose own
+CT chunks are all absent are left absent, so they read as zero. Stored chunks are
+found from one listing of the input store, which does not descend into symlinked
+directories, so the command refuses an input with a symlinked directory
+(symlinked chunk files are fine) and stops if the listing finds no chunk at all.
+
+Repeat the same command to resume completed chunk pairs. Outputs written before
+chunks without CT were left absent record an older provenance version and are
+refused; use a new output directory. Checkpoint, model code,
 plans, input path/shape and numerical settings are recorded and checked on resume.
 Input chunk contents are not hashed; do not replace them during a run/resume.
 
@@ -61,7 +71,7 @@ Both are uint8 (0–255), Blosc/Zstd compressed. Chunk size is configurable with
 `lasagna` attribute, sidecar manifest, or additional pyramid. The tracing array
 is pooled from **blended floating-point probabilities before quantization**;
 odd final planes are omitted, matching the generator. Explicit compressed zero
-chunks record completed empty predictions; untouched empty input tiles can remain
+chunks record completed empty predictions; chunks with no stored CT remain
 absent. Paired publication ensures an interrupted pair is recomputed on resume.
 
 Feed the result directly to the unmodified updated generator:
@@ -83,5 +93,7 @@ to CPU; GPU extraction must separately reserve resources through the manager.
 CPU tests: `python -m pytest -q lasagna/tests/test_qualzz_inference.py`.
 They cover four-class softmax, upstream normalization dispatch, pooled-before-
 quantized output, odd edges, v2 layout, paired completion/provenance validation,
-and serial/spawned-flush inference with exact expected output and resume.
+serial/spawned-flush inference with exact expected output and resume, and
+empty-tile skipping against one dense pass: the same bytes wherever CT is
+stored and absent chunks elsewhere.
 These synthetic tests do not establish full-checkpoint throughput or GPU memory.

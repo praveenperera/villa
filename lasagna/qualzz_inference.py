@@ -16,6 +16,7 @@ from vc_reader.reader import create_group, open_zarr
 
 from lasagna.compact_zarr import _chunk_index, _create_array, _writer, atomic_chunk
 from lasagna.cooperative_inference import cooperative_signals
+from lasagna.input_level import InputLevel
 from lasagna.tiled_predict3d import (
     OutputProductSpec, omezarr_compressor_config, resolve_inference_devices,
     run_tiled_inference_3d,
@@ -148,6 +149,19 @@ class ProbabilityZarrOutputAdapter:
         pass
 
 
+def _first_symlinked_dir(root):
+    """The first directory symlink under ``root``, or None.
+
+    The stored-chunk listing does not descend into symlinked directories, so
+    the CT behind one would read as absent and its tiles would not run.
+    """
+    for parent, dirs, files in os.walk(root):
+        for name in dirs:
+            if os.path.islink(os.path.join(parent, name)):
+                return Path(parent, name)
+    return None
+
+
 @cooperative_signals
 def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
                   tile_size=128, overlap=32, border=16, chunk_size=128,
@@ -174,21 +188,33 @@ def run_inference(*, model_dir, input_path, output, voxel_size_um, devices,
         provenance=dict(model_sha256=hashes, input=str(input_path), input_shape=list(shape),
                         tile_size=tile_size, overlap=overlap, border=border,
                         precision="fp32", accumulator_dtype="float32",
-                        normalization="model.py:normalize_ct per tile", version=1))
+                        normalization="model.py:normalize_ct per tile",
+                        # version 2 leaves chunks without stored CT absent; version 1 predicted
+                        # them, so resuming a version 1 output would keep those predictions
+                        version=2))
     writer.prepare()
     if any(d.type == "cuda" for d in devices) and os.environ.get("LASAGNA_COOPERATIVE") != "1":
         raise ValueError("CUDA inference requires GPU-manager handling (LASAGNA_COOPERATIVE=1)")
     model = adapter.load_model(device=devices[0]) if devices[0].type == "cpu" else None
     nz, ny, nx = shape
-    run_tiled_inference_3d(model, source, crop_slices=(0,nz,0,ny,0,nx), device=devices[0],
-        model_adapter=adapter, output_adapter=writer, products=(product,),
-        output_regions_zyx={product.name: (0,0,0,nz,ny,nx)},
-        full_output_shapes_zyx={product.name: shape},
-        output_scaledown_base=1, tile_size=tile_size, overlap=overlap, border=border,
-        tmp_dir=str(output.parent), temp_prefix=output.stem + "_", devices=devices,
-        progress=dict(t0=time.time(), finalized_base_z=0, finalized_base_z_total=nz),
-        flush_workers=flush_workers, accumulator_workers=accumulator_workers,
-        product_accumulator_dtype="float32")
+    # Tiles without stored CT are skipped, so CT the listing cannot see would
+    # silently leave its output absent
+    linked = _first_symlinked_dir(input_path)
+    if linked is not None:
+        raise ValueError(f"input has a symlinked directory, which the chunk listing does not follow: {linked}; "
+                         "link chunk files instead")
+    with InputLevel(input_path) as input_level:
+        if not input_level.region_has_chunks((0, nz, 0, ny, 0, nx)):
+            raise ValueError(f"input lists no stored chunks: {input_path}")
+        run_tiled_inference_3d(model, source, crop_slices=(0,nz,0,ny,0,nx), device=devices[0],
+            model_adapter=adapter, output_adapter=writer, products=(product,),
+            output_regions_zyx={product.name: (0,0,0,nz,ny,nx)},
+            full_output_shapes_zyx={product.name: shape},
+            output_scaledown_base=1, tile_size=tile_size, overlap=overlap, border=border,
+            tmp_dir=str(output.parent), temp_prefix=output.stem + "_", devices=devices,
+            progress=dict(t0=time.time(), finalized_base_z=0, finalized_base_z_total=nz),
+            flush_workers=flush_workers, accumulator_workers=accumulator_workers,
+            product_accumulator_dtype="float32", input_level=input_level)
     return output
 
 

@@ -166,3 +166,108 @@ def test_cli_always_enables_cooperative_gpu_handling(monkeypatch):
     import os
     assert os.environ["LASAGNA_COOPERATIVE"] == "1"
     assert seen[0]["devices"] == (torch.device("cuda:0"),)
+
+
+CONTEXT_MODEL = '''
+import torch
+class Model(torch.nn.Module):
+    def forward(self, x):
+        # Neighbourhood mean, so a tile read without its halo would differ.
+        a = torch.nn.functional.avg_pool3d(x, 5, stride=1, padding=2)
+        return {"seg": torch.cat((a*0, a*0.7, a*-0.4, a*0.2), dim=1)}
+def load_model(folder, device):
+    return Model().to(device).eval()
+def normalize_ct(x):
+    return (x - x.mean()) / x.std().clamp_min(10)
+'''
+
+
+def _context_model(tmp_path):
+    folder = tmp_path / "model"
+    folder.mkdir()
+    (folder / "model.py").write_text(CONTEXT_MODEL)
+    (folder / "plans.json").write_text("{}")
+    (folder / "checkpoint_final.pth").write_bytes(b"fixture")
+    return folder
+
+
+def _sparse_ct(path, shape=(40, 480, 480), chunk=64):
+    """CT whose only stored chunks are y,x chunk indices 1-2; the rest read as 0."""
+    writer = ZarrWriter.create(path, shape=shape, chunks=(chunk,)*3, dtype=np.uint8,
+                               compressor=None, separator="/")
+    rng = np.random.default_rng(5)
+    writer[:, chunk:3*chunk, chunk:3*chunk] = rng.integers(1, 256, (shape[0], 2*chunk, 2*chunk), np.uint8)
+    return open_zarr(path)
+
+
+@pytest.mark.parametrize("overlap", [32, 64])
+def test_empty_tiles_match_one_dense_pass(tmp_path, monkeypatch, overlap):
+    # overlap 64 blends tile cores, so voxels sum several tiles.
+    folder = _context_model(tmp_path)
+    source = _sparse_ct(tmp_path / "ct.zarr/0")
+    shape, chunk = source.shape, 64
+    calls = []
+    original = QualzzModelAdapter.run_tile_inference
+    def counted(self, model, tile, *, device):
+        calls.append(int(tile.shape[0]))
+        return original(self, model, tile, device=device)
+    monkeypatch.setattr(QualzzModelAdapter, "run_tile_inference", counted)
+
+    # Dense reference: one engine pass over every tile, without an input listing.
+    adapter = QualzzModelAdapter(folder, chunk)
+    product, = adapter.output_products
+    dense = ProbabilityZarrOutputAdapter(tmp_path / "dense.zarr", product, shape,
+                                         voxel_size_um=9.6, provenance={"test": True})
+    dense.prepare()
+    run_tiled_inference_3d(adapter.load_model(device=torch.device("cpu")), source,
+        crop_slices=(0, shape[0], 0, shape[1], 0, shape[2]), device=torch.device("cpu"),
+        model_adapter=adapter, output_adapter=dense, products=(product,),
+        output_regions_zyx={"semantic": (0, 0, 0, *shape)}, full_output_shapes_zyx={"semantic": shape},
+        output_scaledown_base=1, tile_size=128, overlap=overlap, border=16,
+        tmp_dir=str(tmp_path), product_accumulator_dtype="float32")
+    dense_tiles = sum(calls)
+
+    calls.clear()
+    path = run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0",
+                         output=tmp_path / "sparse.zarr", voxel_size_um=9.6,
+                         devices=(torch.device("cpu"),), overlap=overlap, chunk_size=chunk,
+                         flush_workers=0, accumulator_workers=0)
+    sparse, sparse_tiles = open_group(path), sum(calls)
+
+    reference = open_group(dense.root)
+    stored = np.zeros(shape, bool)
+    stored[:, chunk:3*chunk, chunk:3*chunk] = True
+    for name, factor in (("semantic", 1), ("tracing", 2)):
+        expected = reference[name][:]
+        has_ct = stored[::factor, ::factor, ::factor][tuple(slice(n) for n in expected.shape[1:])]
+        actual = sparse[name][:]
+        np.testing.assert_array_equal(actual[:, has_ct], expected[:, has_ct])
+        assert not actual[:, ~has_ct].any()
+        assert expected[:, ~has_ct].any(), "dense pass must predict over absent CT"
+    assert sparse_tiles < dense_tiles
+
+
+def test_input_without_stored_chunks_is_refused(tmp_path):
+    folder = _context_model(tmp_path)
+    ZarrWriter.create(tmp_path / "ct.zarr/0", shape=(8, 8, 8), chunks=(8, 8, 8), dtype=np.uint8,
+                      compressor=None, separator="/")
+    with pytest.raises(ValueError, match="no stored chunks"):
+        run_inference(model_dir=folder, input_path=tmp_path / "ct.zarr/0", output=tmp_path / "out.zarr",
+                      voxel_size_um=9.6, devices=(torch.device("cpu"),), chunk_size=4,
+                      flush_workers=0, accumulator_workers=0)
+
+
+def test_input_with_symlinked_directory_is_refused(tmp_path):
+    folder = _context_model(tmp_path)
+    level = tmp_path / "ct.zarr/0"
+    writer = ZarrWriter.create(level, shape=(8, 8, 8), chunks=(4, 4, 4), dtype=np.uint8,
+                               compressor=None, separator="/")
+    writer[:] = np.ones((8, 8, 8), np.uint8)
+    moved = tmp_path / "elsewhere"
+    (level / "1").rename(moved)
+    (level / "1").symlink_to(moved, target_is_directory=True)
+    assert open_zarr(level)[4:].min() == 1, "the reader follows the link the listing skips"
+    with pytest.raises(ValueError, match="symlinked directory"):
+        run_inference(model_dir=folder, input_path=level, output=tmp_path / "out.zarr",
+                      voxel_size_um=9.6, devices=(torch.device("cpu"),), chunk_size=4,
+                      flush_workers=0, accumulator_workers=0)
