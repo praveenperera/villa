@@ -3663,6 +3663,9 @@ class FitContext:
         def backward_family(weighted_losses):
             """Accumulate one loss family's gradients, then release its graph."""
             family_loss = sum(weighted_losses.values())
+            if os.environ.get('SM_PERTURB') == 'loss':
+                # spiral-metal parity calibration: an ulp-scale nudge to every gradient that AdamW all but ignores
+                family_loss = family_loss * (1.0 + 2.0 ** -22)
             if family_loss.requires_grad:
                 self.step_timer.stop('fwd')
                 self.step_timer.start('bwd')
