@@ -2801,6 +2801,13 @@ def _grouped_radius_targets(
     values[group_id, row_slot] = target_values
     valid = torch.isfinite(values)
     if not use_median:
+        if os.environ.get('SM_PERTURB') == 'target':
+            # spiral-metal parity calibration: the same mean summed as offsets from a detached per-group pivot,
+            # exact in real arithmetic
+            first = values[:, 0, 0].detach()
+            pivot = torch.where(torch.isfinite(first), first, torch.zeros_like(first))[:, None, None]
+            return pivot[:, 0, 0] + torch.where(valid, values - pivot, torch.zeros_like(values)).sum(
+                dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp(min=1)
         return torch.where(valid, values, torch.zeros_like(values)).sum(
             dim=(1, 2)) / valid.sum(dim=(1, 2)).clamp(min=1)
 
