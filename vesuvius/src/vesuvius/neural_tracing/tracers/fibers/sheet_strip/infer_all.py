@@ -50,12 +50,22 @@ def pending_fibers(catalog, chosen, completed):
     return [c for c in chosen if completed.get(catalog[c]['id']) != catalog[c]['reference']]
 
 
+def decision_arcs(fiber, step=STEP):
+    """The arclengths (trace voxels) of a fiber's decisions, ``step`` apart"""
+    return np.arange(MIN_HEAD_ARC, fiber.length+1e-9, step)
+
+
 def strip_of_fiber(predictor, fiber, step=STEP, blend=BLEND, trim=0.):
     """The stitched strip of a fiber (rows (R, Nv, 3) trace voxels, kept nodes, expected |error| per node in voxels
     or None) and its decision arclengths; nodes within ``trim`` trace voxels of the fiber's ends, or beyond them, are
     not kept."""
-    arcs = np.arange(MIN_HEAD_ARC, fiber.length+1e-9, step)
-    heights, scales, frames, positions = predictor.predict(fiber, arcs)
+    arcs = decision_arcs(fiber, step)
+    return stitched_strip(predictor, fiber, arcs, predictor.predict(fiber, arcs), blend, trim)
+
+
+def stitched_strip(predictor, fiber, arcs, result, blend=BLEND, trim=0.):
+    """:func:`strip_of_fiber` from the predictor's ``result`` for the decisions at ``arcs``"""
+    heights, scales, frames, positions = result
     oriented, oriented_frames, flipped = orient_decisions(heights, frames)
     rows, weight, _ = stitch(oriented, oriented_frames, positions, arcs, predictor.f, predictor.v, blend)
     f = predictor.f
@@ -107,7 +117,8 @@ def main(argv=None):
     torch.set_num_threads(args.threads)
     k, n = args.shard
     try:
-        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args)
+        predictor = StripPredictor(args.checkpoint, args.device, args.umbilicus, args.batch, args, crops=args.crops,
+                                   gpu_chunks=args.gpu_chunks)
     except ValueError as error:
         raise SystemExit(str(error))
     f, v, tpp = predictor.f, predictor.v, predictor.trace_per_patch
@@ -143,12 +154,13 @@ def main(argv=None):
     todo = pending_fibers(fibers.catalog, chosen, done)
     print(f'[shard {k}/{n}] {len(chosen)} fibers, {len(chosen)-len(todo)} done already', flush=True)
     with open(log_path, 'a') as log:
-        for count, catalog_index in enumerate(todo, 1):
-            tick = time.time()
+        # decisions are batched across fibers (StripPredictor.predict_many); seconds are per fiber as it completes
+        jobs = ((index, fiber, decision_arcs(fiber, args.step)) for index in todo for fiber in (fibers[index],))
+        tick = time.time()
+        for count, ((catalog_index, fiber, arcs), result) in enumerate(predictor.predict_many(jobs), 1):
             row = fibers.catalog[catalog_index]
             fiber_id, family, length = row['id'], row['family'], row['length']
-            fiber = fibers[catalog_index]
-            rows, keep, expected, arcs = strip_of_fiber(predictor, fiber, args.step, args.blend, args.trim*tpp)
+            rows, keep, expected, arcs = stitched_strip(predictor, fiber, arcs, result, args.blend, args.trim*tpp)
             out = args.out/'strips'/fiber_id[:2]/f'fiber_{fiber_id}'
             nodes = int(keep.sum())
             rows, keep, expected, layout = display_grid(rows, keep, expected, family)
@@ -166,6 +178,7 @@ def main(argv=None):
                 images.write_tiff(out/'expected_error.tif', np.where(keep, expected, np.nan).astype(np.float32))
                 record['expected_error_vox'] = float(np.nanmean(np.where(keep, expected, np.nan)))
             record['seconds'] = round(time.time()-tick, 2)
+            tick = time.time()
             log.write(json.dumps(record)+'\n')
             log.flush()
             decisions += len(arcs)
