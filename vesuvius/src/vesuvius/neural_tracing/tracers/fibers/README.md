@@ -293,6 +293,13 @@ per crop axis rather than per point, and `normalize_ct` makes fewer passes (both
 decisions/s. Running the shards as clients of an NVIDIA MPS daemon (`nvidia-cuda-mps-control -d`, with the shards'
 `CUDA_MPS_PIPE_DIRECTORY` set to its pipe directory) lowers GPU use from 92% to 76% at the same rate.
 
+On Apple GPUs, `--device mps --crops gpu --batch 16` samples the crops with vc_reader's Metal reader and runs the frame
+model and the strip model on the GPU, with the CropCNN, the cell-token gather, the crop z-score and the masked attention
+as Metal kernels (`models/mps*.py`, same weights). On an M4 Pro Mac mini one process wrote strips at about 60
+decisions/s over 21,153 PHerc0211 decisions, in a 6.3 GiB peak, against 7.9 decisions/s for the CPU path; its nodes
+match the `--batch 4 --threads 1` strips to 2.2e-6 voxels on average and 0.001 at most. That run is GPU-bound, so run
+the shards one after another.
+
 A decision every 8 trace voxels (`--step 8`) gave the same stitched strips as every 4 on held-out fibers (median node
 distance to the patch sheet within 0.012 voxels); every 16 was 0.01–0.03 worse. Decisions whose seed lies outside the
 crop skip the CT seed heading they would never read (`infer.skip_remote_seed_heading`; 1.7x), and the others compute
