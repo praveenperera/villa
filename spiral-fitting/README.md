@@ -135,10 +135,13 @@ picks one explicitly (`devices.py`). A distributed (torchrun) fit needs CUDA or
 the CPU: torch.distributed has no MPS backend. The Triton kernels are CUDA only, and the CUDA
 startup check is skipped elsewhere. On MPS, Metal versions of two of them run instead: the gap
 expander's (`gap_metal.py`) and the Cartesian field's direct low-resolution flow integration
-(`flow_metal.py`). The other flow-field types, and the CPU, use the PyTorch paths;
-`FIT_SPIRAL_METAL=0` turns the Metal kernels off. `tests/test_gap_fused.py` and
-`tests/test_flow_direct_fused.py` check the fused kernels of whichever backend the machine has
-against the eager paths.
+(`flow_metal.py`). The track radius loss, the track batch sampler and the nonfinite-gradient
+sanitize also run as Metal kernels on MPS (`track_loss_metal.py`, `grad_metal.py`), so a step
+compiles no per-shape graphs and does not wait on the GPU for tensor shapes. The other flow-field
+types, and the CPU, use the PyTorch paths; `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
+`FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler. `tests/test_gap_fused.py`,
+`tests/test_flow_direct_fused.py` and `tests/test_track_radius_metal.py` check the fused kernels
+of whichever backend the machine has against the eager paths.
 
 The Cartesian field integrates one of two interpolants, which place slightly different surfaces
 for the same parameters. `model_flow_field_direct_lr` (on by default) samples its coarse lattice
