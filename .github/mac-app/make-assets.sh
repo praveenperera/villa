@@ -39,7 +39,7 @@ done
 python3 -I "$here/fix_wheel.py" check-locks "$out"
 
 assets=$(cd "$out" && shasum -a 256 ./*.whl requirements-*.txt "$tarball" | sed 's| \./| |; s|  | |')
-python3 -I - "$here/install-python-tools.command.in" "$out/Install-Python-Tools.command" "$release" "$commit" "$assets" \
+python3 -I - "$here/install-python-tools.sh.in" "$out/install-python-tools.sh" "$release" "$commit" "$assets" \
   "$min_macos" <<'PY'
 import sys
 from pathlib import Path
@@ -51,6 +51,6 @@ for key, value in (("@RELEASE_URL@", release), ("@VILLA_COMMIT@", commit), ("@AS
     text = text.replace(key, value)
 Path(dst).write_text(text)
 PY
-chmod +x "$out/Install-Python-Tools.command"
-bash -n "$out/Install-Python-Tools.command"
+chmod +x "$out/install-python-tools.sh"
+bash -n "$out/install-python-tools.sh"
 echo "assets for $tag (villa $commit) in $out"

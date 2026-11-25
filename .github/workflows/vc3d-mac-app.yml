@@ -180,7 +180,7 @@ jobs:
           trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
           release="$RUNNER_TEMP/release"
           env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin VC3D_TOOLS_ASSETS="$release" \
-            bash "$release/Install-Python-Tools.command"
+            bash "$release/install-python-tools.sh"
           check=.github/mac-app/omp_check.py
           env -i HOME="$home" "$tools/envs/lasagna/bin/python" -I $check vc.volume vc.fiber_trace vc_lasagna_amgx \
             vc_reader vc_object_store
@@ -189,5 +189,5 @@ jobs:
           env -i HOME="$home" "$tools/envs/vesuvius/bin/python" -I $check vc_reader vc_object_store
           # and again: nothing left to do
           env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin VC3D_TOOLS_ASSETS="$release" \
-            bash "$release/Install-Python-Tools.command" | tee "$RUNNER_TEMP/second.log"
+            bash "$release/install-python-tools.sh" | tee "$RUNNER_TEMP/second.log"
           [[ $(grep -c 'already up to date' "$RUNNER_TEMP/second.log") -eq 3 ]]

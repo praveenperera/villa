@@ -1,8 +1,10 @@
 #!/bin/bash
 # Install the Python tools for VC3D's Spiral, Lasagna, sheet-strip and fibre-follow features on an Apple-silicon Mac.
 #
-# Double-click this file, or run it in Terminal. It needs no administrator password, compiler, Xcode, Homebrew or
-# conda: it downloads a pinned copy of uv, which installs Python 3.14 and three environments from prebuilt packages.
+# VC3D for Mac ships this script inside the app and runs it when you click Install, the first time a feature needs the
+# tools or from Help > Install or Update Python Tools. To run it yourself: bash install-python-tools.sh. It needs no
+# administrator password, compiler, Xcode, Homebrew or conda: it downloads a pinned copy of uv, which installs Python
+# 3.14 and three environments from prebuilt packages.
 # Everything goes into one folder:
 #   ~/Library/Application Support/Vesuvius Challenge/VC3D/python-tools
 #     bin/uv          the package installer
@@ -220,7 +222,8 @@ PY
 
 step "Done"
 cat <<EOF
-The Python tools are installed. Open VC3D (or quit and reopen it) to use Spiral, Lasagna and fibre follow.
+The Python tools are installed. VC3D finds them on its own: Spiral, Lasagna, sheet strips and fibre follow use them
+from now on.
 From Terminal, the environments are:
   "$ROOT/envs/spiral/bin/python"
   "$ROOT/envs/lasagna/bin/python"
