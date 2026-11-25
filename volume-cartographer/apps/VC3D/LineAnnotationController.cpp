@@ -35,6 +35,7 @@
 #include "UnifiedBrowserDialog.hpp"
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
+#include "PythonExecutable.hpp"
 #include "PythonToolsInstaller.hpp"
 #include "FiberFollowService.hpp"
 #include "ViewerManager.hpp"
@@ -10751,13 +10752,15 @@ bool LineAnnotationController::ensureFiberFollowService(bool headless,
     const QPointer<LineAnnotationDialog> dialogGuard(dialog);
     QString error;
     // a headless run never asks: without the tools the service start reports its own error
-    const bool tools = headless || vc3d::requirePythonTools(tr("Fibre follow"), QStringLiteral("vesuvius"));
+    const QString python = settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString();
+    const bool tools = headless || vc3d::requirePythonTools(tr("Fibre follow"), QStringLiteral("vesuvius"),
+                                                            vc3d::chosenPythonForServices(python));
     if (!tools) {
         error = vc3d::pythonToolsMissingMessage(tr("Fibre follow"));
     }
     const bool running = tools && FiberFollowService::instance().ensureRunning(
         settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_CHECKPOINT).toString(),
-        settings.value(vc3d::settings::line_annotation::FIBER_FOLLOW_PYTHON).toString(),
+        python,
         &error);
     // The service start processes events while the model boots: an
     // operation that must not continue past a package switch or a teardown

@@ -1447,7 +1447,8 @@ SegmentationLasagnaPanel::startOptimizationWithOverrides(
             return SubmissionResult::failure(msg);
         }
     } else {
-        if (!vc3d::requirePythonTools(tr("Lasagna"), QStringLiteral("lasagna"), this)) {
+        if (!vc3d::requirePythonTools(tr("Lasagna"), QStringLiteral("lasagna"),
+                                      LasagnaServiceManager::chosenPython(), this)) {
             auto msg = vc3d::pythonToolsMissingMessage(tr("Lasagna"));
             showStatus(msg, 5000);
             return SubmissionResult::failure(msg);

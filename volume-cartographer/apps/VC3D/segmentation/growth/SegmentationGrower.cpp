@@ -4,6 +4,7 @@
 
 
 #include "../../NeuralTraceServiceManager.hpp"
+#include "../../PythonExecutable.hpp"
 #include "../../PythonToolsInstaller.hpp"
 #include "../SegmentationModule.hpp"
 #include "../SurfaceCorrections.hpp"
@@ -608,7 +609,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             return false;
         }
 
-        if (!vc3d::requirePythonTools(tr("The neural tracer"), QStringLiteral("vesuvius"))) {
+        if (!vc3d::requirePythonTools(tr("The neural tracer"), QStringLiteral("vesuvius"),
+                                      vc3d::chosenPythonForServices(pythonPath))) {
             showStatus(vc3d::pythonToolsMissingMessage(tr("The neural tracer")), kStatusLong);
             return false;
         }
@@ -830,7 +832,8 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    if (!vc3d::requirePythonTools(tr("Displacement copy"), QStringLiteral("vesuvius"))) {
+    if (!vc3d::requirePythonTools(tr("Displacement copy"), QStringLiteral("vesuvius"),
+                                  vc3d::chosenPythonForServices(pythonPath))) {
         showStatus(vc3d::pythonToolsMissingMessage(tr("Displacement copy")), kStatusLong);
         return false;
     }

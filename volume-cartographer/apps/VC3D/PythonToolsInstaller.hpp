@@ -55,16 +55,19 @@ private:
 void installPythonTools(QWidget* parent);
 
 // Called before `feature` starts a service from the installed environment
-// `env` (spiral, lasagna or vesuvius). True when the feature can go ahead: the
-// environment is installed, this build ships no installer, or the user chose
-// "Don't ask again" (VC3D then looks for a Python as before). Otherwise false,
+// `env` (spiral, lasagna or vesuvius). `chosenPython` is the interpreter the
+// user pointed the feature at (its setting, SPIRAL_PYTHON, an active conda
+// env and the like), or empty; the feature's own lookup decides. True when the
+// feature can go ahead: `chosenPython` is executable, the environment is
+// installed, this build ships no installer, or the user chose "Don't ask
+// again" (VC3D then looks for a Python as before). Otherwise false,
 // and once the caller has returned VC3D asks whether to install the Python
 // tools now; when that install finishes it calls `retry`, if given, so the
 // feature can start after all. It does not ask while it is already asking or
 // installing, and after "Not Now" not again until VC3D restarts or the user
 // installs from the Help menu. `parent` defaults to the active window.
-bool requirePythonTools(const QString& feature, const QString& env, QWidget* parent = nullptr,
-                        std::function<void()> retry = {});
+bool requirePythonTools(const QString& feature, const QString& env, const QString& chosenPython,
+                        QWidget* parent = nullptr, std::function<void()> retry = {});
 
 // What a feature reports when it cannot start because the tools are missing.
 QString pythonToolsMissingMessage(const QString& feature);
