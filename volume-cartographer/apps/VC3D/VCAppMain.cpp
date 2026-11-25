@@ -14,6 +14,7 @@
 #include <QSurfaceFormat>
 
 #include "CWindow.hpp"
+#include "PythonExecutable.hpp"
 #include "SshPrompts.hpp"
 #include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
@@ -60,9 +61,12 @@
 #include <unistd.h>
 #endif
 
-// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv). The
+// launch value is remembered first, so the Python services VC3D starts get
+// the user's settings rather than VC3D's own (vc3d::pythonServiceEnvironment).
 static void vcSetEnv(const char* name, const char* value, int overwrite)
 {
+    vc3d::rememberLaunchEnvironmentValue(name);
 #if defined(_WIN32)
     if (!overwrite && std::getenv(name)) return;
     _putenv_s(name, value);
@@ -243,7 +247,8 @@ auto main(int argc, char* argv[]) -> int
     // threads stay at one thread too and explicit num_threads clauses still
     // apply. Child processes do not inherit this default; the tools VC3D starts
     // get the OMP_NUM_THREADS that setThreadPoliciesEarly() exports, unless
-    // their dialog sets a thread count.
+    // their dialog sets a thread count. The Python services get the values VC3D
+    // was launched with instead (vc3d::pythonServiceEnvironment).
     if (auto fn = reinterpret_cast<void(*)(const char*)>(dlsym(RTLD_DEFAULT, "kmp_set_defaults")))
         fn("OMP_NUM_THREADS=1");
 
