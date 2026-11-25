@@ -65,7 +65,22 @@ fetch() {
     /bin/cp "$LOCAL_ASSETS/$name" "$file.part"
   else
     printf '    downloading %s\n' "$name"
-    /usr/bin/curl --fail --location --silent --show-error --retry 3 --output "$file.part" "$url"
+    local code
+    # the HTTP status, so a missing file reads as such rather than as curl's exit status
+    if ! code=$(/usr/bin/curl --location --silent --show-error --retry 3 --write-out '%{http_code}' \
+      --output "$file.part" "$url"); then
+      /bin/rm -f "$file.part"
+      fail "couldn't download $name from $url. Check the internet connection and install again; finished steps are kept."
+    fi
+    case $code in
+      2??) ;;
+      404)
+        /bin/rm -f "$file.part"
+        fail "couldn't download $name from $url (HTTP 404). The release files for this build may not be published yet." ;;
+      *)
+        /bin/rm -f "$file.part"
+        fail "couldn't download $name from $url (HTTP $code). Install again later; finished steps are kept." ;;
+    esac
   fi
   [ "$(sha256 "$file.part")" = "$want" ] || { /bin/rm -f "$file.part"; fail "$name does not match its checksum"; }
   /bin/mv "$file.part" "$file"
