@@ -1,0 +1,193 @@
+name: VC3D Mac app (fork)
+run-name: VC3D Mac app for macOS 15, ${{ inputs.release_tag || 'vc3d-mac-2026.11.26-1' }}
+
+# Fork-only release build of the downloadable VC3D for Mac, started by hand: the app and the Python tools' wheels,
+# built on GitHub's macOS 15 arm64 runners so both run on macOS 15 and later. It uses no secrets. Developer ID signing,
+# notarization and publishing happen afterwards on a Mac that holds the certificate.
+#   app     VC3D.app with every dylib and Qt plugin inside, checked for leaked Homebrew or build paths and launched with
+#           Homebrew hidden
+#   wheels  the cp314 wheels, the hash-pinned requirements, the source tarball and the filled-in Python tools installer,
+#           which is then run with Homebrew hidden and only the system's tools on PATH
+
+# GitHub only dispatches workflows that exist on the default branch, which stays in step with upstream, so a push to
+# the one branch below starts it too. Nothing else does: no other branch, no pull request
+on:
+  push:
+    branches: [vc3d-mac-app-release]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag the installer downloads its files from
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: '1'
+  HOMEBREW_NO_INSTALL_CLEANUP: '1'
+  # the oldest macOS the release supports: the runner's, whose Homebrew bottles are built for it
+  MIN_MACOS: '15.0'
+  # a push to vc3d-mac-app-release builds this release
+  RELEASE_TAG: ${{ inputs.release_tag || 'vc3d-mac-2026.11.26-1' }}
+
+jobs:
+  app:
+    name: VC3D.app (macOS 15, arm64)
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      SCCACHE_IGNORE_SERVER_IO_ERROR: '1'
+      SCCACHE_C_CUSTOM_CACHE_BUSTER: vc3d-mac-app-macos-15-arm64-v1
+    defaults:
+      run:
+        working-directory: volume-cartographer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: v0.15.0
+
+      # 3 jobs on a 3-core runner with 7 GB: VC3D's thin-LTO link alone peaks near 6 GB
+      - name: Build
+        run: |
+          sysctl -n hw.ncpu hw.memsize
+          /usr/bin/time -l ./scripts/build_macos.sh --install-deps --sccache --jobs 3
+
+      - name: Package VC3D.app
+        run: |
+          export PATH="$(brew --prefix)/opt/llvm/bin:$PATH"
+          cmake --install build-macos --prefix "$RUNNER_TEMP/app" --component vc_runtime
+          app="$RUNNER_TEMP/app/VC3D.app"
+          libomps=$(find "$app" -name 'libomp*')
+          echo "$libomps"
+          [[ $(printf '%s\n' "$libomps" | grep -c .) -eq 1 ]] || { echo "::error::expected exactly one libomp"; exit 1; }
+          codesign --verify --deep --strict "$app"
+          # the newest macOS any Mach-O inside is built for; above MIN_MACOS's major version the app would not start
+          minos=$(find "$app/Contents" -type f -print0 | xargs -0 file | awk -F': ' '/Mach-O/ {sub(/ \(for architecture .*/, "", $1); print $1}' | sort -u \
+            | while IFS= read -r f; do otool -l "$f" | awk '$1 == "minos" {print $2}'; done \
+            | sort -t. -k1,1n -k2,2n | tail -1)
+          echo "highest minos: $minos"
+          [[ ${minos%%.*} -le ${MIN_MACOS%%.*} ]] || { echo "::error::a library needs macOS $minos"; exit 1; }
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/VC3D-mac-app-macos15.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-mac-app-macos15
+          path: ${{ runner.temp }}/VC3D-mac-app-macos15.zip
+          if-no-files-found: error
+
+      # no Mach-O may name a Homebrew or build-tree path in a load command or an rpath, and the app's binaries must
+      # start with Homebrew gone
+      - name: Check the app is self-contained
+        timeout-minutes: 15
+        run: |
+          app="$RUNNER_TEMP/app/VC3D.app"
+          bin="$app/Contents/MacOS"
+          pattern="$(brew --prefix)/|$GITHUB_WORKSPACE|/usr/local/"
+          leaks=$(find "$app" -type f \( -perm +111 -o -name '*.dylib' \) -exec otool -L {} + 2>/dev/null \
+            | grep -E "$pattern" || true)
+          rpath_leaks=$(find "$app" -type f \( -perm +111 -o -name '*.dylib' \) -exec otool -l {} + 2>/dev/null \
+            | awk '/cmd LC_RPATH/ { getline; getline; print }' | grep -E "$pattern" || true)
+          if [[ -n "$leaks$rpath_leaks" ]]; then
+            echo "::error::absolute paths leaked into the bundle:"
+            echo "$leaks"; echo "$rpath_leaks"
+            exit 1
+          fi
+          echo "$(find "$app" -type f -print0 | xargs -0 file | grep -c Mach-O) Mach-O files, no leaked paths"
+
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          # no arguments prints usage and exits 1; anything else means a library failed to load
+          set +e
+          "$bin/vc_tifxyz2obj"; rc=$?
+          set -e
+          [[ $rc -eq 0 || $rc -eq 1 ]] || { echo "::error::vc_tifxyz2obj failed to start (exit $rc)"; exit 1; }
+          QT_QPA_PLATFORM=cocoa "$bin/VC3D" --version
+
+      - name: Upload crash reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-mac-app-crash-reports
+          path: ~/Library/Logs/DiagnosticReports/VC3D*
+          if-no-files-found: ignore
+
+  wheels:
+    name: Python tools (macOS 15, arm64)
+    runs-on: macos-15
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      # the formulae scripts/build_macos.sh installs (the vc bindings build the same C++ tree), plus uv
+      - name: Install build dependencies
+        run: |
+          brew install uv cmake ninja pkgconf ceres-solver eigen opencv c-blosc c-blosc2 concurrentqueue zstd lz4 boost \
+            libtiff libpng jpeg-turbo curl nlohmann-json sqlite openssl@3 lapack openblas libomp scotch hwloc gcc flang \
+            qtbase
+          uv python install 3.14.10
+
+      - name: Build a static OpenCV
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+        run: .github/mac-app/build-opencv.sh "$RUNNER_TEMP/opencv" 3
+
+      # every torch the locks pin: the wheels must load the libomp each of them ships
+      - name: Get torch's OpenMP runtimes
+        run: |
+          libomps=()
+          for version in $(grep -h '^torch==' .github/mac-app/lock-inputs/*.in | cut -d= -f3 | sort -u); do
+            uv venv --quiet --python 3.14.10 "$RUNNER_TEMP/torch-$version"
+            uv pip install --quiet --python "$RUNNER_TEMP/torch-$version/bin/python" "torch==$version"
+            libomps+=("$RUNNER_TEMP/torch-$version/lib/python3.14/site-packages/torch/lib/libomp.dylib")
+          done
+          ls -la "${libomps[@]}"
+          echo "TORCH_LIBOMPS=${libomps[*]}" >> "$GITHUB_ENV"
+
+      - name: Build the wheels
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+          OCV: ${{ runner.temp }}/opencv
+        run: |
+          mkdir -p "$RUNNER_TEMP/src"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/src"
+          /usr/bin/time -l .github/mac-app/build-wheels.sh "$RUNNER_TEMP/src" "$RUNNER_TEMP/wheels-build" 3
+
+      - name: Assemble the release files
+        run: |
+          .github/mac-app/make-assets.sh . "$RUNNER_TEMP/wheels-build/wheels" "$RUNNER_TEMP/release" \
+            "$RELEASE_TAG" "$MIN_MACOS"
+          ls -la "$RUNNER_TEMP/release"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VC3D-mac-python-tools-macos15
+          path: ${{ runner.temp }}/release
+          if-no-files-found: error
+
+      # the installer as a tester runs it: no Homebrew, only the system's tools on PATH, a fresh home. The release
+      # files come from this run instead of the release, which does not exist yet
+      - name: Install the Python tools with Homebrew hidden
+        timeout-minutes: 45
+        run: |
+          home="$RUNNER_TEMP/home"; mkdir -p "$home"
+          tools="$home/Library/Application Support/Vesuvius Challenge/VC3D/python-tools"
+          sudo mv /opt/homebrew /opt/homebrew.hidden
+          trap 'sudo mv /opt/homebrew.hidden /opt/homebrew' EXIT
+          release="$RUNNER_TEMP/release"
+          env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin VC3D_TOOLS_ASSETS="$release" \
+            bash "$release/Install-Python-Tools.command"
+          check=.github/mac-app/omp_check.py
+          env -i HOME="$home" "$tools/envs/lasagna/bin/python" -I $check vc.volume vc.fiber_trace vc_lasagna_amgx \
+            vc_reader vc_object_store
+          env -i HOME="$home" "$tools/envs/spiral/bin/python" -I $check vc_spiral.spiral_sampling vc_spiral.track_store \
+            vc_reader vc_object_store posix_ipc
+          env -i HOME="$home" "$tools/envs/vesuvius/bin/python" -I $check vc_reader vc_object_store
+          # and again: nothing left to do
+          env -i HOME="$home" PATH=/usr/bin:/bin:/usr/sbin:/sbin VC3D_TOOLS_ASSETS="$release" \
+            bash "$release/Install-Python-Tools.command" | tee "$RUNNER_TEMP/second.log"
+          [[ $(grep -c 'already up to date' "$RUNNER_TEMP/second.log") -eq 3 ]]
