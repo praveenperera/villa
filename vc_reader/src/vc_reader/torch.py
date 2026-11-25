@@ -342,10 +342,11 @@ def sample_array(values, points, *, order=1, boundary="zeros", fill=0):
     Native CPU/CUDA forward and first-order gradients for values and coordinates.
     CUDA value gradients use atomic addition, like torch grid_sample. Coordinate
     gradients and forward values have no competing floating-point writes.
-    MPS runs order-1, zeros-boundary, zero-fill sampling through torch
-    grid_sample (the same taps, within float32 rounding of the coordinate
-    normalization) and stages other cases through CPU; both retain autograd.
-    Double backward is unsupported.
+    MPS runs order-1, zeros-boundary, zero-fill sampling that needs no
+    gradient through torch grid_sample (the same taps, within float32 rounding
+    of the coordinate normalization). PyTorch has no MPS grid_sample backward,
+    so calls that need gradients, and other cases, stage through CPU, which
+    keeps autograd. Double backward is unsupported.
     """
     if values.ndim not in (4, 5) or points.ndim < 3 or points.shape[0] != values.shape[0] or points.shape[-1] != values.ndim-2:
         raise ValueError('expected B,C,[Z,]Y,X values and B,...,D points')
@@ -353,7 +354,8 @@ def sample_array(values, points, *, order=1, boundary="zeros", fill=0):
         raise ValueError('values and points must be on the same device')
     device = values.device
     if device.type == 'mps':
-        if order == 1 and boundary == "zeros" and fill == 0 and min(values.shape[2:]) > 1:
+        needs_grad = torch.is_grad_enabled() and (values.requires_grad or points.requires_grad)
+        if order == 1 and boundary == "zeros" and fill == 0 and min(values.shape[2:]) > 1 and not needs_grad:
             return _grid_sample_linear(values, points)
         return sample_array(values.cpu(), points.cpu(), order=order, boundary=boundary, fill=fill).to(device)
     shape = points.shape[1:-1]
