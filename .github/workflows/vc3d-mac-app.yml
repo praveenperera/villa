@@ -123,6 +123,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # the wheels build with Apple clang, and the C++ uses std::jthread, which libc++ before 20 only offers as
+      # experimental (Xcode 16.4's does): take the newest Xcode, and the experimental library only if it still needs it
+      - name: Choose the Xcode
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+        run: |
+          xcode=$(ls -d /Applications/Xcode_*.app | grep -v -i -E "beta|release_candidate" | sort -V | tail -1)
+          sudo xcode-select -s "$xcode/Contents/Developer"
+          /usr/bin/clang++ --version | head -1
+          probe="$RUNNER_TEMP/jthread.cpp"
+          printf '#include <stop_token>\n#include <thread>\nint main() { std::jthread t([](std::stop_token) {}); }\n' > "$probe"
+          if /usr/bin/clang++ -std=c++20 "$probe" -o "$RUNNER_TEMP/jthread"; then
+            echo "$xcode has std::jthread"
+          elif /usr/bin/clang++ -std=c++20 -fexperimental-library "$probe" -o "$RUNNER_TEMP/jthread"; then
+            echo "$xcode has std::jthread with -fexperimental-library"
+            echo "CXXFLAGS=-fexperimental-library" >> "$GITHUB_ENV"
+          else
+            echo "::error::no std::jthread in $xcode for macOS $MACOSX_DEPLOYMENT_TARGET"; exit 1
+          fi
+          "$RUNNER_TEMP/jthread"
+
       # the formulae scripts/build_macos.sh installs (the vc bindings build the same C++ tree), plus uv
       - name: Install build dependencies
         run: |
