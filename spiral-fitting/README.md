@@ -90,16 +90,36 @@ track fit is not automatically equivalent to a new store-backed fit.
 Kimimaro skeletonization. The local `vc-reader` dependency requires its native
 build prerequisites (see [vc_reader](../vc_reader/README.md)).
 
-Use `--slab-workers N --kimimaro-parallel 1` to process multiple slabs concurrently
-on Linux with local predictions. Each worker holds a slab in RAM; the default is
-one worker and eight Kimimaro processes per slab.
+Slabs run in parallel in worker processes, each with one Kimimaro process and
+its own slab in RAM, on every platform. `--slab-workers auto`, the default,
+starts one worker for every two CPUs, at most 8 (each worker keeps more than one
+CPU busy, and more than 8 has not been measured). It starts only as many as fit
+in the memory available at the start less 4 GB, which stays free for other
+work (in a container, the memory its cgroup v2 limit leaves when that is
+less), at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
+full-width ribbon of a 7948 × 7948 scroll at downsample 2 peaked at 1.8 GB;
+1536 × 1536 crops take about 0.4 GB a worker), and runs one slab at a time when
+the predictions are remote. `--kimimaro-parallel auto`, also the default, gives
+each slab one Kimimaro process when several workers run. When slabs run one at
+a time, Linux gives each slab 8; Kimimaro starts its processes anew for every
+slab, which is slow on macOS and Windows, so there a slab still gets one. A set
+`--slab-workers N` or `--kimimaro-parallel N` always wins; with
+`--kimimaro-parallel` above 1 and no `--slab-workers`, slabs run one at a time.
+Pass `--slab-workers N` to leave CPUs or memory for other work.
 
 ```sh
 python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
+  --out /data/tracks.dbm --z-min 9048 --z-max 9548
+python extract_surface_tracks.py --backend cpu --predictions /data/predictions.zarr \
   --out /data/tracks.dbm --z-min 9048 --z-max 9548 \
-  --slab-workers 4 --kimimaro-parallel 1
+  --slab-workers 4
 python -m pytest -q tests/test_cc_labels.py tests/test_extract_surface_tracks.py
 ```
+
+The CPU backend turns skeletons into tracks with `fast_tracks.py`, as the GPU
+backend does: compiled with numba where `uv sync` installs it (Linux x86-64 and
+macOS arm64), and with its vectorized NumPy engine elsewhere. With one Kimimaro
+process per slab the DBM does not depend on the number of slab workers.
 
 ## CUDA startup check
 
@@ -177,6 +197,11 @@ from `devices.float_hi()`, which is float32 on MPS;
 comparing a CPU run with an MPS one. `get_ink_metrics.py --device` picks the
 nnU-Net device; without it the folds take CUDA, else MPS, else the CPU, whatever
 the fitting variables say.
+
+The spiral's winding angles (`sample_spiral.get_spiral_yxs`) are always built
+in float64, since float32 angles move the outer nodes by up to half a voxel.
+Where `float_hi()` is float32 they are built on the CPU and only the node
+positions are copied to the device.
 
 ## Opt-in flow-field switches
 
@@ -1089,7 +1114,29 @@ lease file under its output directory. Uploads accept resume checkpoints only.
 ### Creating the Spiral Python environment
 
 The service host needs the Spiral environment (a CUDA-capable PyTorch plus the
-dependencies in `pyproject.toml`, Python ≥ 3.14). With [uv](https://docs.astral.sh/uv/):
+dependencies in `pyproject.toml`, Python ≥ 3.14).
+
+`uv sync` compiles the local `vc_reader` and `vc_object_store` packages, and
+`uv` does not install system C++ libraries. Install them first. On Ubuntu,
+with the Universe component enabled:
+
+```sh
+sudo apt-get update
+sudo apt-get install -y build-essential cmake ninja-build pkg-config git \
+  libboost-dev libconcurrentqueue-dev nlohmann-json3-dev libsqlite3-dev \
+  libssl-dev libcurl4-openssl-dev zlib1g-dev libblosc-dev libblosc2-dev \
+  liblz4-dev libzstd-dev libopencv-dev libtiff-dev libpng-dev libjpeg-dev \
+  python3-dev
+```
+
+`python3-dev` is needed when `uv` builds against the system Python, as it does
+on Ubuntu 26.04 (Python 3.14) unless it already has a managed 3.14.
+`volume-cartographer/scripts/install_build_deps.sh` installs the C++ libraries
+(plus Qt and the other VC3D dependencies). The standalone `vc_object_ingest`,
+`vc_object_server` and `vc_object_convert` tools build from `vc_object_store`
+with the same packages; leave `VC_OBJECT_STORE_BUILD_LINKING` on (the default,
+unlike its README's test build), because Spiral's link refresh needs it in
+`vc_object_server`. Then, with [uv](https://docs.astral.sh/uv/):
 
 ```sh
 cd spiral-fitting
@@ -1098,7 +1145,8 @@ uv sync            # creates .venv from pyproject.toml
 
 This also builds Spiral's native helpers as `vc_spiral.spiral_sampling`,
 `vc_spiral.track_crossings` and `vc_spiral.track_store`. OpenMP is used when the toolchain provides it; the
-same modules build with serial kernels when it does not.
+same modules build with serial kernels when it does not, and always on Windows
+(MSVC) and macOS, where torch's wheels load their own OpenMP runtime.
 
 or with conda/pip, install `torch` for your CUDA version and then
 `pip install -e . --group cuda` from `spiral-fitting/` (pip 25.1 or newer).
@@ -1125,6 +1173,24 @@ uv pip install -e '.[cpu]'
 
 Use `.venv/bin/python` (or `uv run --no-sync`) afterwards: a plain `uv sync`
 or `uv run` would reinstall the CUDA build of torch and the `cuda` group.
+
+On macOS, `vc_object_store` links Homebrew's OpenCV, which links OpenBLAS, which
+loads Homebrew's `libomp.dylib`, and torch loads its own copy. The two copies share
+symbols, and whichever loads first serves both, which crashes torch's threads when
+`vc_object_store` is imported first. So on macOS, when torch is installed,
+importing `vc_object_store` loads and starts torch's `libomp.dylib` first and keeps
+the copy it brings itself to one thread. Two runtimes stop Python with
+`OMP: Error #15` unless `KMP_DUPLICATE_LIB_OK=TRUE` is set, so the import sets it
+while the two start and then removes it (a value you set is left alone): torch and
+`vc_object_store` can be imported in either order, and later loads and child
+processes keep the check. If another `libomp.dylib` was loaded before torch's when
+`vc_object_store` is imported (pykdtree's, which `import kimimaro` loads), or you set
+`KMP_DUPLICATE_LIB_OK` to a false value, the import arranges nothing and OpenMP's own
+check reports it. Wheels that bundle a `libomp.dylib` are otherwise not covered:
+`import kimimaro` before `import torch` crashes torch's threads, with or without
+`vc_object_store`; pykdtree's copy stops Python with `OMP: Error #15` when it starts
+beside torch's, and with `KMP_DUPLICATE_LIB_OK=TRUE` the two crash when both run
+threads. Spiral's own modules use no OpenMP on macOS.
 
 ### Resident sparse field pools
 
@@ -1563,7 +1629,7 @@ backend reads a local zarr v2 array in the layout of the surface predictions
 (uint8, blosc, `/` chunk keys) straight from its chunk files instead. The z
 range is half-open (`[z-min, z-max)`).
 
-Two backends write the same keys in the same format:
+Three backends write the same keys in the same format:
 
 - `gpu`: Brook (`brook-cu12`) and cuCIM on NVIDIA GPUs, one worker process
   per GPU. It needs Linux x86-64, GPUs of compute capability 8.0 or newer
@@ -1576,23 +1642,50 @@ Two backends write the same keys in the same format:
   (`nvidia-smi` indices, PCI bus order); UUID and MIG entries are not accepted,
   so pass `--gpus` instead. With `--gpus`, `--backend auto` does not fall back
   to Kimimaro when the GPU backend cannot run.
-- `cpu`: Kimimaro, one slab at a time. `uv sync` installs it on every platform
+- `metal`: teasar (`teasar` on PyPI) on Apple-silicon GPUs. `uv sync` installs
+  it on Apple-silicon Macs as the default `metal` dependency group
+  (`--no-group metal` skips it). Slabs teasar declines run on Kimimaro.
+- `cpu`: Kimimaro, with slabs in parallel worker processes (see
+  [CPU surface-track extraction](#cpu-surface-track-extraction)). `uv sync` installs it on every platform
   except Linux x86-64, where it is the optional `cpu` extra
   (`uv sync --extra cpu`) for machines without a compatible GPU.
 
 `--backend auto` (the default) picks the GPU backend when its check passes
 (platform, packages, and the NVIDIA driver version and the compute capability
 of the selected GPUs, as reported by `nvidia-smi`) and `path_mode` is
-`'interjoint'`, and Kimimaro otherwise. The
-script prints the backend it uses and why. `--backend gpu` and `--backend cpu`
-stop with the reason when that backend cannot run. The GPU backend implements
-only the `'interjoint'` path mode.
+`'interjoint'`, then the metal backend when its check passes, and Kimimaro
+otherwise. The script prints the backend it uses and why. `--backend gpu`,
+`--backend metal` and `--backend cpu` stop with the reason when that backend
+cannot run. Both GPU backends implement only the `'interjoint'` path mode.
+
+The metal backend runs connected-component labelling, pooling and the size
+filter on the Mac's GPU with teasar, skeletonizes the pooled labels with
+teasar (on host threads with the default `kimimaro` target order), and walks
+the skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
+configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
+and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
+8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
+teasar declines while preparing its labels (one over its size limits) runs
+through the CPU backend from the start. A slab it declines while skeletonizing
+(a call whose output would be too large, or a setting it does not support)
+runs on Kimimaro from the labels teasar already computed. The run prints how
+many slabs teasar declined. Keys are written in
+the same order as with the CPU backend, so a run resumes the same way.
+
+`--teasar-target-order` sets the order teasar traces each skeleton's branches
+in. The default, `kimimaro`, follows Kimimaro's order, so the tracks stay
+compatible with the CPU backend's; while the installed teasar does not
+implement it, the run says so and extracts with the CPU backend instead.
+`best` is teasar's own order: its skeletons are close to Kimimaro's but not
+identical, as with Brook.
 
 Brook implements Kimimaro's skeletonization on the GPU. Its skeletons are close
 to Kimimaro's but not always identical, so the two backends' DBMs agree closely
-rather than byte for byte (see the measurements below). Kimimaro collects the
-skeletons of its 8 worker processes as they finish, so the order of the tracks
-within a key can also differ between two CPU runs.
+rather than byte for byte (see the measurements below). With several Kimimaro
+processes per slab (Linux's default when slabs run one at a time), Kimimaro
+collects their skeletons as they finish, so the order of the tracks within a key
+can also differ between two CPU runs; with one per slab (the default whenever
+several slab workers run) it cannot.
 
 Every key (`h:{z}`, `vy:{y}`, `vx:{x}`) holds a pickled list of `(N, 3)` int32
 ZYX arrays in full-resolution voxels, and an empty slab holds an empty list.
