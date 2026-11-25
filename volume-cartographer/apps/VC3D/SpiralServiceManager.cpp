@@ -1,6 +1,7 @@
 #include "SpiralServiceManager.hpp"
 
 #include "PythonExecutable.hpp"
+#include "PythonToolsInstaller.hpp"
 #include "SpiralArtifactCache.hpp"
 #include "SpiralArtifactPins.hpp"
 #include "SpiralPreviewProvenance.hpp"
@@ -27,6 +28,7 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QMessageBox>
+#include <QPointer>
 #include <QProcessEnvironment>
 #include <QPushButton>
 #include <QRandomGenerator>
@@ -331,6 +333,16 @@ void SpiralServiceManager::startLocalProcess()
         return;
     }
     _waitingForLocalStore = false;
+    // after an install from the prompt, start the service this connection was waiting for, unless the user moved on
+    const auto retry = [self = QPointer<SpiralServiceManager>(this)] {
+        if (self && self->_connectionState == ConnectionState::Failed) {
+            self->connectToService(self->_profile);
+        }
+    };
+    if (!vc3d::requirePythonTools(tr("Spiral"), QStringLiteral("spiral"), nullptr, retry)) {
+        setConnectionState(ConnectionState::Failed, vc3d::pythonToolsMissingMessage(tr("Spiral")));
+        return;
+    }
     QString outputRoot = _profile.outputRoot.trimmed();
     if (outputRoot.isEmpty())
         outputRoot = defaultLocalOutputRoot(_localStorePath);
