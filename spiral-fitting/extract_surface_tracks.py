@@ -26,8 +26,9 @@ Three backends write the same keys in the same format:
   cpu    Kimimaro on the CPU, several slabs at once in worker processes
          (--slab-workers); vc_reader labels connected components on the CPU.
 
-Brook and teasar implement TEASAR skeletonization on the GPU; their skeletons
-are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
+Brook implements TEASAR skeletonization on the GPU. teasar prepares the labels
+on the GPU and, with the default target order, skeletonizes on host threads.
+Their skeletons are close to Kimimaro's but not identical. ``--backend auto`` uses the first of
 gpu, metal and cpu that can run. Both GPU backends need ``path_mode``
 ``'interjoint'``, and metal also needs one of the slab configurations teasar
 supports (``TEASAR_SETTINGS``).
@@ -240,7 +241,7 @@ def prepare_cc_labels(predictions_binary):
     # Area thresholds are specified in full-res voxels; convert to downsampled by ds**3.
     import cc3d
     from vc_reader.geometry import label_components
-    cc_labels, _ = label_components(predictions_binary, connectivity=6)
+    cc_labels, _ = label_components(predictions_binary, connectivity=6, threads=cc_label_threads)
     # cc3d.dust and Kimimaro expect unsigned label arrays; labels are non-negative, so a view of
     # vc_reader's int32 labels saves a full-resolution copy
     if cc_labels.dtype == np.int32:
@@ -258,8 +259,9 @@ def prepare_cc_labels(predictions_binary):
     return cc_labels
 
 
-def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes):
-    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM.
+def _slab_tracks(predictions_zarr_array, index, offset_zyx, kimimaro_processes=None):
+    # Pickled tracks of one slab (read, binarize, CC, skeletonize), as stored in the DBM. None
+    # Kimimaro processes means the count for slabs run one at a time, as in the metal fallback
     predictions = binarize(predictions_zarr_array[index])
     if predictions.max() == 0:
         return pickle.dumps([])
@@ -278,9 +280,14 @@ def binarize(predictions):
 
 
 _worker_array = None  # the opened array, inherited by forked workers
+# Threads vc_reader labels a slab's components with; 0 uses every CPU. Several slab workers split
+# the CPUs between them, since a pool of every CPU in each worker oversubscribes the machine and
+# can exceed a container's process limit
+cc_label_threads = 0
 # Module settings the slab workers read. Spawned workers re-import this file, so they get
 # the parent's values (possibly set from the command line) through _worker_init.
-_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode')
+_WORKER_SETTINGS = ('downsample_factor', 'dust_threshold', 'max_area_threshold', 'path_mode',
+                    'cc_label_threads')
 
 
 def _worker_init(array, settings):
@@ -304,6 +311,8 @@ def _run_slabs(predictions_zarr_array, tracks_db, jobs, desc):
     workers, processes = cpu_parallelism(predictions_zarr_array.shape, len(jobs))
     print(f'  {len(jobs)} slabs, {workers} slab worker(s) with {processes} Kimimaro '
           f'process(es) each')
+    global cc_label_threads
+    cc_label_threads = 0 if workers <= 1 else max(1, (_cpu_count() or 1) // workers)
     if workers <= 1:
         for key, index, offset in tqdm(jobs, desc=desc):
             tracks_db[key] = _slab_tracks(predictions_zarr_array, index, offset, processes)
@@ -491,17 +500,47 @@ def _physical_memory():
     return None
 
 
+def _cgroup_memory_headroom(cgroup_root='/sys/fs/cgroup', proc_cgroup='/proc/self/cgroup'):
+    # Bytes this process's cgroup v2 and its ancestors let it add (memory.max less memory.current,
+    # the lowest along the path), or None outside cgroup v2 or with no limit. Containers often
+    # limit memory below what the host reports as available.
+    try:
+        with open(proc_cgroup) as f:
+            path = next(line[3:].strip() for line in f if line.startswith('0::'))
+    except (OSError, StopIteration):
+        return None
+    headroom = None
+    parts = [p for p in path.split('/') if p]
+    for depth in range(len(parts), -1, -1):
+        group = os.path.join(cgroup_root, *parts[:depth])
+        try:
+            with open(os.path.join(group, 'memory.max')) as f:
+                limit = f.read().strip()
+            with open(os.path.join(group, 'memory.current')) as f:
+                current = int(f.read())
+        except (OSError, ValueError):
+            continue
+        if limit != 'max':
+            left = max(0, int(limit) - current)
+            headroom = left if headroom is None else min(headroom, left)
+    return headroom
+
+
 def _available_memory():
-    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), or None
-    # when unknown. psutil comes with Kimimaro outside Windows.
+    # Bytes of RAM new processes can take now without swapping (free plus reclaimable), bounded by
+    # the cgroup's headroom, or None when unknown. psutil comes with Kimimaro outside Windows.
     if sys.platform == 'win32':
         status = _windows_memory_status()
         return status.ullAvailPhys if status else None
     try:
         import psutil
+        available = psutil.virtual_memory().available
     except ImportError:
-        return None
-    return psutil.virtual_memory().available
+        available = None
+    headroom = _cgroup_memory_headroom()
+    if headroom is None:
+        return available
+    return headroom if available is None else min(available, headroom)
 
 
 def _slab_worker_memory():
@@ -514,6 +553,10 @@ def _slab_worker_memory():
     return total // 2 if total else None
 
 
+def _cpu_count():
+    return os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+
+
 def auto_slab_workers(shape, n_jobs):
     """Slab workers for ``--slab-workers auto``: one for every two CPUs, at most
     ``_MAX_AUTO_SLAB_WORKERS``, as many as fit with the largest slab of this extraction in the
@@ -521,7 +564,7 @@ def auto_slab_workers(shape, n_jobs):
     ``--kimimaro-parallel`` asks for several Kimimaro processes per slab."""
     if kimimaro_parallel != 'auto' and kimimaro_parallel > 1 or n_jobs <= 1:
         return 1
-    cpus = os.process_cpu_count() if hasattr(os, 'process_cpu_count') else os.cpu_count()
+    cpus = _cpu_count()
     z_range = max(0, min(z_max, shape[0]) - min(z_min, shape[0]))
     largest = max(z_chunk_depth_h * shape[1] * shape[2],
                   z_range * yx_chunk_thickness_v * shape[2],
@@ -653,8 +696,10 @@ class MetalSlabs:
     def labels(self, predictions):
         """Pooled labels of one binarized slab, or None when teasar declines it."""
         try:
+            # teasar takes C-order arrays only, and a Fortran-order Zarr v2 slab binarizes to
+            # Fortran order; a no-op for the usual C-order slab
             return self.device.prepare_labels(
-                predictions, downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
+                np.ascontiguousarray(predictions), downsample_factor, max(1, dust_threshold // downsample_factor ** 3),
                 max(1, max_area_threshold // downsample_factor ** 3), settings=self.settings)
         except (self.teasar.UnsupportedSettings, self.teasar.InputTooLarge):
             return None
@@ -665,11 +710,10 @@ class MetalSlabs:
         pending = []  # (position, labels, offset) of the slabs left for one skeletonize call
         for i, (_, index, offset) in enumerate(batch):
             predictions = binarize(predictions_zarr_array[index])
-            if predictions.max() == 0:
+            # a slab thinner than one max-pool cell pools to nothing, so it has no tracks, as the
+            # job lists record for the thin slabs they skip
+            if predictions.max() == 0 or min(predictions.shape) < downsample_factor:
                 results[i] = pickle.dumps([])
-                continue
-            if min(predictions.shape) < downsample_factor:
-                results[i] = _slab_tracks(predictions_zarr_array, index, offset)
                 continue
             labels = self.labels(predictions)
             del predictions

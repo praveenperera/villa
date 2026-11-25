@@ -435,6 +435,28 @@ def test_cpu_defaults_on_every_os(monkeypatch, tmp_path, platform, serial):
     assert run('--predictions', 's3://b/p.zarr') == (1, serial)
 
 
+def test_available_memory_is_bounded_by_the_cgroup(monkeypatch, tmp_path):
+    # A container's cgroup v2 limit, on its own group or an ancestor, caps what the host reports
+    proc = tmp_path / 'cgroup'
+    proc.write_text('0::/user.slice/job\n')
+    for group, limit, current in [('', None, None), ('user.slice', 20 * 2**30, 4 * 2**30),
+                                  ('user.slice/job', 'max', 2**30)]:
+        (tmp_path / group).mkdir(parents=True, exist_ok=True)
+        if limit is not None:
+            (tmp_path / group / 'memory.max').write_text(f'{limit}\n')
+            (tmp_path / group / 'memory.current').write_text(f'{current}\n')
+    assert est._cgroup_memory_headroom(str(tmp_path), str(proc)) == 16 * 2**30
+    assert est._cgroup_memory_headroom(str(tmp_path), str(tmp_path / 'missing')) is None
+
+    psutil = pytest.importorskip('psutil')
+    monkeypatch.setattr(sys, 'platform', 'linux')
+    monkeypatch.setattr(psutil, 'virtual_memory', lambda: types.SimpleNamespace(available=50 * 2**30))
+    monkeypatch.setattr(est, '_cgroup_memory_headroom', lambda: 16 * 2**30)
+    assert est._available_memory() == 16 * 2**30
+    monkeypatch.setattr(est, '_cgroup_memory_headroom', lambda: None)
+    assert est._available_memory() == 50 * 2**30
+
+
 def test_command_line_reaches_the_backend(monkeypatch, tmp_path):
     runs = []
     monkeypatch.setattr(est, 'z_min', est.z_min)  # main() sets the z range; restore it after
@@ -715,10 +737,12 @@ class _Packed:
         self.edges = np.concatenate(edges) if edges else np.zeros((0, 2), np.uint32)
 
 
-def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro', 'best')):
+def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro', 'best'),
+                 declines=()):
     """A ``teasar`` module whose device runs villa's own CPU stages, so its tracks equal the CPU
     backend's. ``failures`` maps a skeletonize call number to the exception that call raises;
-    ``target_orders`` are the orders it accepts. Calls on all-zero slabs are not counted."""
+    ``target_orders`` are the orders it accepts. Calls on all-zero slabs are not counted.
+    ``declines`` are the prepare_labels call numbers that raise InputTooLarge."""
     module = types.ModuleType('teasar')
     module.__version__ = '0.0.test'
 
@@ -741,6 +765,7 @@ def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro'
     for cls in (UnsupportedSettings, SomaUnsupported, InputTooLarge, OutputTooLarge):
         setattr(module, cls.__name__, cls)
     calls = module.calls = []  # the number of slabs of each skeletonize call
+    prepared = module.prepared = []  # the shape of each prepare_labels call's slab
 
     class Device:
         name = 'Fake GPU'
@@ -753,6 +778,11 @@ def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro'
 
         def prepare_labels(self, binary, downsample, min_count, max_count, *, settings):
             assert settings == settings_name
+            if not binary.flags.c_contiguous:
+                raise ValueError('binary must be C-contiguous')
+            prepared.append(binary.shape)
+            if len(prepared) in declines:
+                raise InputTooLarge(f'slab {binary.shape}')
             assert (downsample, min_count, max_count) == (
                 est.downsample_factor, max(1, est.dust_threshold // downsample ** 3),
                 max(1, est.max_area_threshold // downsample ** 3))
@@ -786,7 +816,7 @@ def _fake_teasar(kimimaro, settings_name, failures=(), target_orders=('kimimaro'
 
 
 def _metal_setup(monkeypatch, failures=(), target_order='kimimaro',
-                 target_orders=('kimimaro', 'best')):
+                 target_orders=('kimimaro', 'best'), declines=()):
     kimimaro = pytest.importorskip('kimimaro')
     pytest.importorskip('cc3d')
     _small_configuration(monkeypatch)
@@ -799,9 +829,28 @@ def _metal_setup(monkeypatch, failures=(), target_order='kimimaro',
         return kimimaro.skeletonize(labels, **{**kwargs, 'parallel': 1})
     monkeypatch.setattr(est, 'get_skeleton_tracks',
                         functools.partial(est.get_skeleton_tracks, skeletonize=skeletonize))
-    teasar = _fake_teasar(kimimaro, 'small', failures, target_orders)
+    teasar = _fake_teasar(kimimaro, 'small', failures, target_orders, declines)
     monkeypatch.setitem(sys.modules, 'teasar', teasar)
     return teasar
+
+
+def test_metal_slabs_fall_back_to_kimimaro_one_by_one(monkeypatch):
+    # A slab teasar declines before skeletonizing runs on Kimimaro alone, and one thinner than
+    # the downsample factor has no tracks; a Fortran-order array (Zarr v2 order 'F') reaches
+    # teasar in C order
+    teasar = _metal_setup(monkeypatch, declines={2})
+    volume = np.asfortranarray(synthetic_predictions())
+    jobs = est.horizontal_jobs(volume, {})[2:5]
+    assert all(volume[index].any() for _, index, _ in jobs)
+    expected = [est._slab_tracks(volume, index, offset) for _, index, offset in jobs]
+    assert all(pickle.loads(data) for data in expected)
+    _, index, offset = jobs[0]
+    jobs.append(('thin', slice(index.start, index.start + est.downsample_factor - 1), offset))
+
+    slabs = est.MetalSlabs(teasar.Device(), teasar, 'small')
+    assert slabs.tracks(volume, jobs) == [*expected, pickle.dumps([])]
+    assert len(teasar.prepared) == 3 and teasar.calls == [2]
+    assert slabs.declined == 1
 
 
 @pytest.mark.parametrize('failures, calls', [

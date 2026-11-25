@@ -95,7 +95,8 @@ its own slab in RAM, on every platform. `--slab-workers auto`, the default,
 starts one worker for every two CPUs, at most 8 (each worker keeps more than one
 CPU busy, and more than 8 has not been measured). It starts only as many as fit
 in the memory available at the start less 4 GB, which stays free for other
-work, at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
+work (in a container, the memory its cgroup v2 limit leaves when that is
+less), at about 16 bytes per voxel of the largest slab plus 256 MB a worker (a
 full-width ribbon of a 7948 × 7948 scroll at downsample 2 peaked at 1.8 GB;
 1536 × 1536 crops take about 0.4 GB a worker), and runs one slab at a time when
 the predictions are remote. `--kimimaro-parallel auto`, also the default, gives
@@ -1657,15 +1658,18 @@ otherwise. The script prints the backend it uses and why. `--backend gpu`,
 `--backend metal` and `--backend cpu` stop with the reason when that backend
 cannot run. Both GPU backends implement only the `'interjoint'` path mode.
 
-The metal backend runs connected-component labelling, pooling, the size
-filter and skeletonization on the Mac's GPU with teasar, and walks the
-skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
+The metal backend runs connected-component labelling, pooling and the size
+filter on the Mac's GPU with teasar, skeletonizes the pooled labels with
+teasar (on host threads with the default `kimimaro` target order), and walks
+the skeletons into tracks with `fast_tracks.py`. teasar supports the two slab
 configurations in `TEASAR_SETTINGS`: the defaults at the top of the script,
 and the published PHerc0211 configuration (downsample 2, 2-voxel ribbons every
 8, 4-voxel slabs every 16). Any other configuration uses Kimimaro. A slab
-teasar declines (a slab over its size limits, a call whose output would be
-too large, or a setting it does not support) runs on Kimimaro from the labels
-teasar already computed, and the run prints how many did. Keys are written in
+teasar declines while preparing its labels (one over its size limits) runs
+through the CPU backend from the start. A slab it declines while skeletonizing
+(a call whose output would be too large, or a setting it does not support)
+runs on Kimimaro from the labels teasar already computed. The run prints how
+many slabs teasar declined. Keys are written in
 the same order as with the CPU backend, so a run resumes the same way.
 
 `--teasar-target-order` sets the order teasar traces each skeleton's branches
