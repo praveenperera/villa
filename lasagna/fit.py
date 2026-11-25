@@ -1749,7 +1749,9 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		init_shell_dir = _require_init_shell_dir(
 			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
-		if device.type == "cuda":
+		# the ROI needs normals at a few points only, so the GPUs stream chunks instead of dense-loading whole
+		# volumes, as the main fit does; the CPU keeps its dense load
+		if device.type in ("cuda", "mps"):
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
@@ -2228,6 +2230,8 @@ def main(argv: list[str] | None = None, *, lifecycle_fn=None,
 		cfg,
 		init_mode=model_cfg.init_mode if model_init == "seed" else None,
 	)
+	# fail before the data loads, not at the first backward
+	optimizer.require_device_support(stages, device)
 	print("[fit] optimizer stages:", flush=True)
 	for i, st in enumerate(stages):
 		if st.children:
