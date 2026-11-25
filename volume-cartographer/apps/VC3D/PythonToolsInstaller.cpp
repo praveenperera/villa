@@ -224,9 +224,14 @@ void askToInstall(const QString& feature, const QString& env, QWidget* parent, c
 
 }  // namespace
 
-bool requirePythonTools(const QString& feature, const QString& env, QWidget* parent, std::function<void()> retry)
+bool requirePythonTools(const QString& feature, const QString& env, const QString& chosenPython, QWidget* parent,
+                        std::function<void()> retry)
 {
     if (bundledPythonToolsInstaller().isEmpty() || environmentReady(env)) {
+        return true;
+    }
+    // a Python the user set up for this feature is theirs to keep: no prompt, and no second copy of PyTorch
+    if (!chosenPython.isEmpty() && QFileInfo(chosenPython).isExecutable()) {
         return true;
     }
     QSettings stored(settingsFilePath(), QSettings::IniFormat);
