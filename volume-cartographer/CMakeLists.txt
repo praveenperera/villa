@@ -581,6 +581,11 @@ if(VC_BUILD_PYTHON)
     find_package(nanobind CONFIG REQUIRED)
 endif()
 
+# The no-op OpenMP shim as a target of its own, so a target that must stay
+# serial in a build with real OpenMP (the macOS Python modules) can link it
+add_library(openmp_stub INTERFACE)
+target_include_directories(openmp_stub INTERFACE ${CMAKE_SOURCE_DIR}/core/openmp_stub)
+
 if((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE) OR MSVC)
     # Clang off macOS and MSVC use the no-op OpenMP shim: -fopenmp / -openmp is
     # never enabled, so every `#pragma omp` is ignored and the omp_*() runtime
@@ -590,7 +595,6 @@ if((CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND NOT APPLE) OR MSVC)
     # build link real OpenMP. (MSVC silences the resulting unknown-pragma C4068
     # in the compiler-family block.)
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
-    add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
 else()
@@ -601,11 +605,15 @@ else()
         # loads both copies crashes in the OpenMP runtime. Point FindOpenMP at
         # the formula, the one copy every dependency already loads; the cache
         # entries also reach FetchContent subprojects that look up OpenMP.
+        # /usr/local is Homebrew's prefix on Intel Macs, for builds run without
+        # HOMEBREW_PREFIX set.
         find_path(VC_LIBOMP_INCLUDE_DIR omp.h
             HINTS "$ENV{HOMEBREW_PREFIX}/opt/libomp/include" "/opt/homebrew/opt/libomp/include"
+            "/usr/local/opt/libomp/include"
             NO_DEFAULT_PATH)
         find_library(VC_LIBOMP_LIBRARY omp
             HINTS "$ENV{HOMEBREW_PREFIX}/opt/libomp/lib" "/opt/homebrew/opt/libomp/lib"
+            "/usr/local/opt/libomp/lib"
             NO_DEFAULT_PATH)
         if(NOT VC_LIBOMP_INCLUDE_DIR OR NOT VC_LIBOMP_LIBRARY)
             message(FATAL_ERROR "OpenMP on macOS needs Homebrew's libomp: brew install libomp")
