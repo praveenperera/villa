@@ -159,7 +159,8 @@ Metal kernels on MPS (`track_loss_metal.py`, `grad_metal.py`), and, when track l
 are set and the resampled points fit in GPU memory, the track batch sampler plans each batch on the
 host and gathers it in one dispatch. Neither the radius loss nor the sampler compiles per-shape
 graphs or reads tensor shapes back from the GPU. On MPS the resampled track points stay on the
-device, as on CUDA. The track DT loss, the other flow-field types, and the CPU use the PyTorch
+device, as on CUDA, while they fit in a fifth of the Metal memory still free; otherwise the fit keeps
+them on the host. The track DT loss, the other flow-field types, and the CPU use the PyTorch
 paths; `FIT_SPIRAL_METAL=0` turns the Metal kernels off, and
 `FIT_SPIRAL_METAL_TRACKS=0` turns off only the track loss and sampler. `tests/test_gap_fused.py`,
 `tests/test_flow_direct_fused.py` and `tests/test_track_radius_metal.py` check the fused kernels
