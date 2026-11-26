@@ -64,7 +64,7 @@ jobs:
   pr-noop:
     name: Build + package (Homebrew LLVM, arm64)
     if: github.event_name == 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - run: echo "Native compile coverage is provided by the required vc3d-ci macOS job."
@@ -75,7 +75,7 @@ jobs:
   python-tools:
     name: Python tools (arm64)
     if: github.event_name != 'pull_request'
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     timeout-minutes: 180
     continue-on-error: true
     outputs:
@@ -188,7 +188,7 @@ jobs:
     name: Build + package (Homebrew LLVM, arm64)
     if: ${{ !cancelled() && github.event_name != 'pull_request' }}
     needs: python-tools
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     timeout-minutes: 180
     env:
       AGENTS_AGENT_MODE: '1'
@@ -419,7 +419,7 @@ jobs:
     name: Attach macOS package to release
     if: ${{ !cancelled() && github.event_name == 'release' && needs.build-macos.result == 'success' }}
     needs: [python-tools, build-macos]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       actions: read
