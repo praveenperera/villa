@@ -72,12 +72,12 @@ jobs:
             | sort -t. -k1,1n -k2,2n | tail -1)
           echo "highest minos: $minos"
           [[ ${minos%%.*} -le ${MIN_MACOS%%.*} ]] || { echo "::error::a library needs macOS $minos"; exit 1; }
-          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/VC3D-mac-app-macos15.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "$RUNNER_TEMP/VC3D-mac-app.zip"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VC3D-mac-app-macos15
-          path: ${{ runner.temp }}/VC3D-mac-app-macos15.zip
+          name: VC3D-mac-app
+          path: ${{ runner.temp }}/VC3D-mac-app.zip
           if-no-files-found: error
 
       # no Mach-O may name a Homebrew or build-tree path in a load command or an rpath, and the app's binaries must
@@ -186,7 +186,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: VC3D-mac-python-tools-macos15
+          name: VC3D-mac-python-tools
           path: ${{ runner.temp }}/release
           if-no-files-found: error
 

@@ -3,6 +3,9 @@
 # per environment, and the installer with the release's checksums filled in. Pins come from the environments the
 # mac-all features were tested with (lock-inputs/*.in); our own packages resolve from the wheels.
 #   make-assets.sh VILLA_CHECKOUT WHEELS_DIR OUT RELEASE_TAG MIN_MACOS
+# RELEASE_TAG is vc3d-mac-YYYY.MM.DD, or vc3d-mac-YYYY.MM.DD-N for a later release that day. It names no macOS version,
+# since one release serves every supported system. The installer downloads from that tag's release, so the tag set
+# here (the workflow's RELEASE_TAG) is the one the release must be published under
 # MIN_MACOS (such as 15.0 or 27.2) is the oldest macOS the wheels run on. The locks resolve for it, so every pinned
 # package has a wheel that installs there, and the installer refuses anything older
 # OUT must be new or empty, so the installer lists exactly this run's files. The wheels hold only native extensions and
@@ -11,6 +14,8 @@
 set -euo pipefail
 villa=$(cd "$1" && pwd); wheels=$(cd "$2" && pwd); out=$3; tag=$4; min_macos=$5
 [[ $min_macos =~ ^[0-9]+\.[0-9]+$ ]] || { echo "MIN_MACOS must look like 15.0, not $min_macos" >&2; exit 1; }
+[[ $tag =~ ^vc3d-mac-[0-9]{4}\.[0-9]{2}\.[0-9]{2}(-[0-9]+)?$ ]] ||
+  { echo "RELEASE_TAG must look like vc3d-mac-2026.11.25 or vc3d-mac-2026.11.25-2, not $tag" >&2; exit 1; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 PYV=3.14.10
 mkdir -p "$out"; out=$(cd "$out" && pwd)
